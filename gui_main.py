@@ -3,26 +3,26 @@ gui_main.py
 
 PySide6 GUI for the IBKR trading bot.
 
-Fixes applied per user feedback:
-- Account Balance tab now includes:
-  - PAPER/LIVE mode selector (radio buttons)
-  - paper account id input
-  - live account id input
-  - each with a one-line description next to it
-- All config options shown in the settings tabs include a brief description.
-  - Unknown/unmapped options still render a default description string so that
-    every row has a description column.
-- Config editors are no longer needlessly wide:
-  - editors use a constrained maximum width and fixed horizontal size policy
-  - description column expands instead of editors
+REFRACTOR (per user requirement):
+- The GUI input fields are the source of truth after launch.
+- Config file is loaded ONLY on application launch.
+- UI fields are populated ONCE at launch (if config exists).
+- Runtime config is updated ONLY from UI events (editingFinished / toggles).
+- Save writes runtime config to disk ONLY when Save is pressed.
+- The periodic GUI refresh NEVER writes into editable fields.
 
-Hard rules preserved:
-- GUI reads/writes SharedState only (no worker thread calls).
+Other requirements preserved:
 - Exactly five tabs: Real Time, Straddle Settings, PCS+Tail Settings,
   Account Balance, Debug.
 - Real Time tab shows snapshot metrics, selected options (planned + active),
   and status/event panes together.
-- Save writes config ONLY when Save button is pressed.
+- Account Balance tab includes PAPER/LIVE selector + paper/live account IDs.
+- Every config option row shown includes a one-line description (fallback used
+  if missing).
+- Config editors are compact; descriptions expand.
+- GUI touches only SharedState (no direct IBKR calls).
+
+Python: 3.10.4
 """
 
 from __future__ import annotations
@@ -100,48 +100,85 @@ def _vwap_dev(last: Optional[float], vwap: Optional[float]) -> Optional[float]:
 
 
 # =============================================================================
+# SECTION: Logging adapter (works with either shared.event_log or shared.log_info)
+# =============================================================================
+
+def _log_info(shared: SharedState, msg: str) -> None:
+    """
+    Log an informational message using the available logging surface.
+    """
+    if hasattr(shared, "event_log") and hasattr(shared.event_log, "log_info"):
+        shared.event_log.log_info(msg)
+        return
+    if hasattr(shared, "log_info"):
+        shared.log_info(msg)  # type: ignore[attr-defined]
+        return
+
+
+def _log_warn(shared: SharedState, msg: str) -> None:
+    """
+    Log a warning message using the available logging surface.
+    """
+    if hasattr(shared, "event_log") and hasattr(shared.event_log, "log_warn"):
+        shared.event_log.log_warn(msg)
+        return
+    if hasattr(shared, "log_warn"):
+        shared.log_warn(msg)  # type: ignore[attr-defined]
+        return
+
+
+def _get_event_rows_text(shared: SharedState) -> str:
+    """
+    Return event log as a newline-joined string.
+    """
+    if hasattr(shared, "event_log") and hasattr(shared.event_log, "rows"):
+        rows = list(shared.event_log.rows)  # type: ignore[attr-defined]
+        return "\n".join([getattr(r, "text", str(r)) for r in rows])
+    return ""
+
+
+# =============================================================================
 # SECTION: Config metadata (description + tab routing)
 # =============================================================================
 
-# Every displayed config row includes a one-line description.
-# For any config path not present here, a safe fallback description is used.
+# Every row displayed must have a one-line description; unknown keys will use a fallback.
 CONFIG_META: Dict[str, Tuple[str, str]] = {
     # (description, tab_name)
 
-    # Threads (Debug)
+    # Threads
     "threads.md_hub_tick_s": ("MarketDataHub publish tick (seconds).", "Debug"),
     "threads.planners_tick_s": ("Planner tick rate (seconds).", "Debug"),
     "threads.triggers_tick_s": ("Trigger supervisor scan tick (seconds).", "Debug"),
     "threads.execution_tick_s": ("ExecutionEngine management tick (seconds).", "Debug"),
     "threads.gui_refresh_tick_s": ("GUI refresh timer interval (seconds).", "Debug"),
 
-    # Account (Account Balance)
+    # Account
     "account.mode": ("Select PAPER vs LIVE.", "Account Balance"),
     "account.paper_account_id": ("IBKR paper account id; required to connect in PAPER.", "Account Balance"),
     "account.live_account_id": ("IBKR live account id; required to connect in LIVE.", "Account Balance"),
     "account.starting_balance_override": ("Starting balance used until NetLiq read (0 disables).", "Account Balance"),
-    "account.require_account_id_to_connect": ("Prevent connect unless selected mode account id is set.", "Account Balance"),
+    "account.require_account_id_to_connect": ("Prevent connect unless selected mode id is set.", "Account Balance"),
 
-    # UI (Straddle/Debug)
+    # UI
     "ui.allow_confirm_anytime_when_armable": ("Allow Confirm button anytime while armable is true.", "Straddle Settings"),
     "ui.popup_on_armable": ("Show popup when gate becomes ARMABLE (manual mode).", "Straddle Settings"),
     "ui.sound_on_armable": ("Play sound when gate becomes ARMABLE (manual mode).", "Straddle Settings"),
     "ui.event_log_capacity": ("Max number of event rows retained in ring buffer.", "Debug"),
 
-    # Export (Account Balance)
+    # Export
     "export.export_dir": ("Directory for EOD exports.", "Account Balance"),
     "export.export_jsonl": ("Enable JSONL export at EOD.", "Account Balance"),
     "export.export_csv": ("Enable CSV export at EOD.", "Account Balance"),
     "export.export_once_per_day": ("Write EOD files once per day only.", "Account Balance"),
 
-    # Debug (Debug)
+    # Debug
     "debug.run_mode": ("REAL places orders; SIM simulates; REPLAY uses snapshot file.", "Debug"),
     "debug.replay_file": ("Path to replay snapshot series file.", "Debug"),
     "debug.replay_step_mode": ("If true, advance replay only via GUI step.", "Debug"),
     "debug.sim_fill_assume_complete": ("SIM fills assumed complete if quotes exist.", "Debug"),
     "debug.sim_deterministic_slippage_ticks": ("SIM deterministic slippage in ticks.", "Debug"),
 
-    # Straddle (Straddle Settings)
+    # Straddle (partial; add more as needed)
     "straddle.enable_bull": ("Enable bull gate evaluation.", "Straddle Settings"),
     "straddle.enable_bear": ("Enable bear gate evaluation.", "Straddle Settings"),
     "straddle.enable_neutral": ("Enable neutral gate evaluation.", "Straddle Settings"),
@@ -153,19 +190,14 @@ CONFIG_META: Dict[str, Tuple[str, str]] = {
     "straddle.call_delta_target": ("Call delta target for selection.", "Straddle Settings"),
     "straddle.put_delta_target": ("Put delta target (absolute) for selection.", "Straddle Settings"),
     "straddle.delta_tolerance": ("Delta tolerance around target.", "Straddle Settings"),
-    "straddle.budget_pct_available_funds": ("Budget as % of AvailableFunds.", "Straddle Settings"),
-    "straddle.leg_cap_pct_each": ("Per-leg cap as % of budget (limit-price based).", "Straddle Settings"),
     "straddle.entry_spread_max_pct_mid": ("Max spread% of mid allowed for entry (each leg).", "Straddle Settings"),
-    "straddle.entry_price_tick_size": ("Tick size used for entry price improvement.", "Straddle Settings"),
-    "straddle.entry_price_unchanged_s": ("Seconds mid must remain unchanged before +1 tick.", "Straddle Settings"),
     "straddle.entry_fill_timeout_s": ("Entry timeout seconds before cancel remainder.", "Straddle Settings"),
     "straddle.stop_soft_pct": ("Soft stop P&L percent (bid-based).", "Straddle Settings"),
     "straddle.stop_hard_pct": ("Hard stop P&L percent immediate trigger.", "Straddle Settings"),
-    "straddle.stop_soft_hold_s": ("Soft stop must persist this long before exit.", "Straddle Settings"),
     "straddle.ratchet_ladder": ("Profit thresholds mapped to stop lock levels.", "Straddle Settings"),
     "straddle.hang_seconds": ("No-new-high hang seconds before hang exit.", "Straddle Settings"),
 
-    # PCS + Tail (PCS+Tail Settings)
+    # PCS + Tail (partial; add more as needed)
     "pcs.once_per_day_lock": ("Enforce PCS once/day hard lock.", "PCS+Tail Settings"),
     "pcs.min_bars_since_open": ("Minimum bars since open required.", "PCS+Tail Settings"),
     "pcs.deadline_time_et": ("PCS deadline time (ET, HH:MM).", "PCS+Tail Settings"),
@@ -177,12 +209,10 @@ CONFIG_META: Dict[str, Tuple[str, str]] = {
     "pcs.delta_tolerance": ("Delta tolerance for PCS/tail selection.", "PCS+Tail Settings"),
     "pcs.width_points": ("Spread width in points.", "PCS+Tail Settings"),
     "pcs.fixed_budget": ("Fixed PCS budget in dollars.", "PCS+Tail Settings"),
-    "pcs.budget_credit_mult": ("Require credit_total * mult <= budget.", "PCS+Tail Settings"),
     "pcs.entry_spread_max_pct_mid": ("Max spread% of mid allowed for entry (each leg).", "PCS+Tail Settings"),
-    "pcs.stop_debit_mult": ("Stop when debit_to_close >= mult * credit_received.", "PCS+Tail Settings"),
+    "pcs.stop_debit_mult": ("Stop when debit_to_close >= mult*credit_received.", "PCS+Tail Settings"),
     "pcs.tail_delta_target": ("Tail delta target.", "PCS+Tail Settings"),
     "pcs.tail_qty_mult_of_pcs": ("Tail qty multiplier (floor).", "PCS+Tail Settings"),
-    "pcs.tail_activation_profit_mult_of_credit": ("Tail stop activates after this profit multiple.", "PCS+Tail Settings"),
     "pcs.tail_ratchet_ladder": ("Tail ratchet ladder thresholds/locks (credit multiples).", "PCS+Tail Settings"),
     "pcs.tail_hang_seconds": ("Tail hang seconds once stops active.", "PCS+Tail Settings"),
 }
@@ -198,9 +228,8 @@ def _flatten_dataclass(obj: Any, prefix: str = "") -> Dict[str, Any]:
     if not is_dataclass(obj):
         return out
     for f in fields(obj):
-        name = f.name
-        val = getattr(obj, name)
-        path = f"{prefix}{name}" if prefix == "" else f"{prefix}.{name}"
+        val = getattr(obj, f.name)
+        path = f"{prefix}{f.name}" if prefix == "" else f"{prefix}.{f.name}"
         if is_dataclass(val):
             out.update(_flatten_dataclass(val, path))
         else:
@@ -218,7 +247,7 @@ def _set_by_path(root: Any, path: str, value: Any) -> None:
 
 
 # =============================================================================
-# SECTION: Log/status views
+# SECTION: Event / status views
 # =============================================================================
 
 class EventTextView(QTextEdit):
@@ -267,6 +296,7 @@ class MainWindow(QMainWindow):
         self._tabs = QTabWidget()
         self.setCentralWidget(self._tabs)
 
+        # Tabs
         self._rt_tab = self._build_realtime_tab()
         self._straddle_tab = self._build_config_tab(self.TAB_STRADDLE)
         self._pcs_tab = self._build_config_tab(self.TAB_PCS)
@@ -279,6 +309,10 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._account_tab, self.TAB_ACCOUNT)
         self._tabs.addTab(self._debug_tab, self.TAB_DEBUG)
 
+        # ONE-TIME initialization of account widgets from config (launch only)
+        self._init_account_widgets_from_config()
+
+        # Refresh timer
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_all)  # type: ignore[attr-defined]
         self._timer.start(int(self._shared.config.threads.gui_refresh_tick_s * 1000))
@@ -293,6 +327,7 @@ class MainWindow(QMainWindow):
         w = QWidget()
         root = QVBoxLayout(w)
 
+        # Snapshot metrics
         metrics_box = QGroupBox("Market Snapshot")
         grid = QGridLayout(metrics_box)
 
@@ -313,6 +348,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self._lbl_md_age, 2, 0, 1, 3)
         root.addWidget(metrics_box)
 
+        # Options table
         self._opt_table = QTableWidget(0, 11)
         self._opt_table.setHorizontalHeaderLabels(
             [
@@ -333,6 +369,7 @@ class MainWindow(QMainWindow):
         root.addWidget(QLabel("Selected SPX Options (planned + active)"))
         root.addWidget(self._opt_table)
 
+        # Controls
         controls = QGroupBox("Controls")
         hb = QHBoxLayout(controls)
 
@@ -374,6 +411,7 @@ class MainWindow(QMainWindow):
 
         root.addWidget(controls)
 
+        # Status + events together
         text_row = QHBoxLayout()
         self._status_view = StatusTextView()
         self._event_view = EventTextView()
@@ -400,9 +438,7 @@ class MainWindow(QMainWindow):
         form.setFormAlignment(Qt.AlignTop)
 
         flat = _flatten_dataclass(self._shared.config)
-        paths = sorted(flat.keys())
-
-        for path in paths:
+        for path in sorted(flat.keys()):
             meta = CONFIG_META.get(path)
             if meta is None:
                 desc, tab_for_key = ("(Description missing: add to CONFIG_META.)", self.TAB_DEBUG)
@@ -414,10 +450,9 @@ class MainWindow(QMainWindow):
             label = QLabel(path)
             label.setToolTip(desc)
 
-            editor, getter = self._make_editor_for_value(path, flat[path])
+            editor, getter = self._make_editor_for_value(flat[path])
             editor.setToolTip(desc)
 
-            # Row with constrained editor width and expanding description.
             row = QWidget()
             hb = QHBoxLayout(row)
             hb.setContentsMargins(0, 0, 0, 0)
@@ -431,8 +466,6 @@ class MainWindow(QMainWindow):
             hb.addWidget(desc_lbl, 1)
 
             form.addRow(label, row)
-
-            # Live apply on change/edit end.
             self._wire_live_apply(editor, path, getter)
 
         scroll.setWidget(inner)
@@ -457,14 +490,13 @@ class MainWindow(QMainWindow):
         elif isinstance(editor, QLineEdit):
             editor.editingFinished.connect(lambda: self._apply_config_value(path, getter()))  # type: ignore[attr-defined]
 
-    def _make_editor_for_value(self, path: str, value: Any) -> Tuple[QWidget, Callable[[], Any]]:
+    def _make_editor_for_value(self, value: Any) -> Tuple[QWidget, Callable[[], Any]]:
         """
-        Create a compact editor for a config value.
+        Create a compact editor for a config leaf value.
 
         Width policy:
-        - Editors are constrained so the description column consumes extra space.
+        - Editors are constrained; description expands.
         """
-        # AccountMode / RunMode as combo boxes
         if isinstance(value, AccountMode):
             cb = QComboBox()
             cb.addItems([m.value for m in AccountMode])
@@ -528,7 +560,7 @@ class MainWindow(QMainWindow):
         # Default string / structured literal editor
         le = QLineEdit(str(value))
         le.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        le.setMaximumWidth(260)
+        le.setMaximumWidth(280)
 
         def getter() -> Any:
             txt = le.text()
@@ -545,50 +577,32 @@ class MainWindow(QMainWindow):
         with self._shared.lock:
             _set_by_path(self._shared.config, path, value)
 
-    def _on_save_config(self) -> None:
-        with self._shared.lock:
-            cfg = self._shared.config
-
-        # Support either save_config(cfg) or save_config(cfg, path)
-        try:
-            sig = inspect.signature(save_config)
-            if len(sig.parameters) >= 2:
-                save_config(cfg, CONFIG_PATH)  # type: ignore[misc]
-            else:
-                save_config(cfg)  # type: ignore[misc]
-            self._shared.log_info("• Config saved to disk.")
-        except Exception as e:
-            self._shared.log_warn(f"• Config save failed: {e!r}")
-
     # -------------------------------------------------------------------------
-    # Account Balance tab (includes account mode + ids per your requirement)
+    # Account Balance tab (mode + ids)
     # -------------------------------------------------------------------------
 
     def _build_account_tab(self) -> QWidget:
         w = QWidget()
         root = QVBoxLayout(w)
 
-        # Account configuration group
         acct_cfg = QGroupBox("Account Configuration")
         form = QFormLayout(acct_cfg)
         form.setLabelAlignment(Qt.AlignLeft)
         form.setFormAlignment(Qt.AlignTop)
 
-        # Mode selector (radio buttons)
+        # Mode selector
         mode_row = QWidget()
         mode_hb = QHBoxLayout(mode_row)
         mode_hb.setContentsMargins(0, 0, 0, 0)
 
         self._rb_paper = QRadioButton("PAPER")
         self._rb_live = QRadioButton("LIVE")
-
         self._rb_paper.toggled.connect(self._on_mode_changed)  # type: ignore[attr-defined]
         self._rb_live.toggled.connect(self._on_mode_changed)  # type: ignore[attr-defined]
-
         mode_hb.addWidget(self._rb_paper)
         mode_hb.addWidget(self._rb_live)
 
-        mode_desc = QLabel("Select which account mode is active. Connection requires the selected mode id.")
+        mode_desc = QLabel("Select account mode. The selected mode id must be set to connect.")
         mode_desc.setWordWrap(True)
         mode_desc.setStyleSheet("color: #666;")
         mode_desc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -600,13 +614,13 @@ class MainWindow(QMainWindow):
         mode_wrap_hb.addWidget(mode_desc, 1)
         form.addRow(QLabel("account.mode"), mode_wrap)
 
-        # Paper account id
+        # Paper id
         self._le_paper_id = QLineEdit()
-        self._le_paper_id.setMaximumWidth(260)
+        self._le_paper_id.setMaximumWidth(300)
         self._le_paper_id.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self._le_paper_id.editingFinished.connect(self._on_account_ids_changed)  # type: ignore[attr-defined]
+        self._le_paper_id.editingFinished.connect(self._on_paper_id_committed)  # type: ignore[attr-defined]
 
-        paper_desc = QLabel("IBKR paper account id used for connection when mode=PAPER.")
+        paper_desc = QLabel("IBKR paper account id (used when mode=PAPER).")
         paper_desc.setWordWrap(True)
         paper_desc.setStyleSheet("color: #666;")
         paper_desc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -618,13 +632,13 @@ class MainWindow(QMainWindow):
         paper_hb.addWidget(paper_desc, 1)
         form.addRow(QLabel("account.paper_account_id"), paper_wrap)
 
-        # Live account id
+        # Live id
         self._le_live_id = QLineEdit()
-        self._le_live_id.setMaximumWidth(260)
+        self._le_live_id.setMaximumWidth(300)
         self._le_live_id.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self._le_live_id.editingFinished.connect(self._on_account_ids_changed)  # type: ignore[attr-defined]
+        self._le_live_id.editingFinished.connect(self._on_live_id_committed)  # type: ignore[attr-defined]
 
-        live_desc = QLabel("IBKR live account id used for connection when mode=LIVE.")
+        live_desc = QLabel("IBKR live account id (used when mode=LIVE).")
         live_desc.setWordWrap(True)
         live_desc.setStyleSheet("color: #666;")
         live_desc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -636,14 +650,14 @@ class MainWindow(QMainWindow):
         live_hb.addWidget(live_desc, 1)
         form.addRow(QLabel("account.live_account_id"), live_wrap)
 
-        # Save button (explicit, disk write only on press)
+        # Save button
         btn_save = QPushButton("Save Config")
         btn_save.clicked.connect(self._on_save_config)  # type: ignore[attr-defined]
         form.addRow(QLabel(""), btn_save)
 
         root.addWidget(acct_cfg)
 
-        # Account status (read-only)
+        # Account read-only summary
         self._acct_status = QLabel("Account: N/A")
         self._acct_balances = QLabel("Balances: N/A")
         root.addWidget(self._acct_status)
@@ -655,18 +669,18 @@ class MainWindow(QMainWindow):
         self._ledger_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         root.addWidget(self._ledger_view, 1)
 
-        # Initialize from current config
-        self._sync_account_widgets_from_config()
-
         return w
 
-    def _sync_account_widgets_from_config(self) -> None:
+    def _init_account_widgets_from_config(self) -> None:
+        """
+        ONE-TIME initialization of account widgets from loaded config.
+        After this call, periodic refresh MUST NOT write into these fields.
+        """
         with self._shared.lock:
             mode = self._shared.config.account.mode
             paper_id = self._shared.config.account.paper_account_id
             live_id = self._shared.config.account.live_account_id
 
-        # Avoid signal churn while setting
         self._rb_paper.blockSignals(True)
         self._rb_live.blockSignals(True)
         self._rb_paper.setChecked(mode == AccountMode.PAPER)
@@ -674,19 +688,44 @@ class MainWindow(QMainWindow):
         self._rb_paper.blockSignals(False)
         self._rb_live.blockSignals(False)
 
+        self._le_paper_id.blockSignals(True)
+        self._le_live_id.blockSignals(True)
         self._le_paper_id.setText(paper_id)
         self._le_live_id.setText(live_id)
+        self._le_paper_id.blockSignals(False)
+        self._le_live_id.blockSignals(False)
+
+    # --- Account UI -> runtime config only ---
 
     def _on_mode_changed(self) -> None:
-        # Called on toggles; apply mode live.
         new_mode = AccountMode.PAPER if self._rb_paper.isChecked() else AccountMode.LIVE
         with self._shared.lock:
             self._shared.config.account.mode = new_mode
 
-    def _on_account_ids_changed(self) -> None:
+    def _on_paper_id_committed(self) -> None:
         with self._shared.lock:
             self._shared.config.account.paper_account_id = self._le_paper_id.text().strip()
+
+    def _on_live_id_committed(self) -> None:
+        with self._shared.lock:
             self._shared.config.account.live_account_id = self._le_live_id.text().strip()
+
+    # -------------------------------------------------------------------------
+    # Save config (disk write only on press)
+    # -------------------------------------------------------------------------
+
+    def _on_save_config(self) -> None:
+        with self._shared.lock:
+            cfg = self._shared.config
+        try:
+            sig = inspect.signature(save_config)
+            if len(sig.parameters) >= 2:
+                save_config(cfg, CONFIG_PATH)  # type: ignore[misc]
+            else:
+                save_config(cfg)  # type: ignore[misc]
+            _log_info(self._shared, "• Config saved to disk.")
+        except Exception as e:
+            _log_warn(self._shared, f"• Config save failed: {e!r}")
 
     # -------------------------------------------------------------------------
     # Controls callbacks
@@ -699,23 +738,23 @@ class MainWindow(QMainWindow):
     def _on_straddle_open(self) -> None:
         with self._shared.lock:
             self._shared.gui.straddle_open_pressed = True
-        self._shared.event_log.log_info("• GUI: STRADDLE OPEN pressed.")
+        _log_info(self._shared, "• GUI: STRADDLE OPEN pressed.")
 
     def _on_straddle_confirm(self) -> None:
         with self._shared.lock:
             self._shared.gui.manual_confirm_pressed = True
-        self._shared.event_log.log_info("• GUI: STRADDLE CONFIRM pressed.")
+        _log_info(self._shared, "• GUI: STRADDLE CONFIRM pressed.")
 
     def _on_pcs_open(self) -> None:
         with self._shared.lock:
             self._shared.gui.pcs_open_pressed = True
-        self._shared.event_log.log_info("• GUI: PCS OPEN pressed.")
+        _log_info(self._shared, "• GUI: PCS OPEN pressed.")
 
     def _on_shutdown(self) -> None:
         with self._shared.lock:
             self._shared.gui.shutdown_pressed = True
         self._shared.shutdown_event.set()
-        self._shared.event_log.log_warn("• GUI: Shutdown/Flatten pressed.")
+        _log_warn(self._shared, "• GUI: Shutdown/Flatten pressed.")
 
     def _confirm(self, title: str, text: str) -> bool:
         r = QMessageBox.question(self, title, text, QMessageBox.Yes | QMessageBox.No)
@@ -726,29 +765,29 @@ class MainWindow(QMainWindow):
             return
         with self._shared.lock:
             self._shared.gui.clear_lock_straddle_timed = True
-        self._shared.event_log.log_info("• GUI: Clear STRADDLE TIMED lock requested.")
+        _log_info(self._shared, "• GUI: Clear STRADDLE TIMED lock requested.")
 
     def _on_clear_straddle_gated(self) -> None:
         if not self._confirm("Confirm", "Clear STRADDLE GATED day lock?"):
             return
         with self._shared.lock:
             self._shared.gui.clear_lock_straddle_gated = True
-        self._shared.event_log.log_info("• GUI: Clear STRADDLE GATED lock requested.")
+        _log_info(self._shared, "• GUI: Clear STRADDLE GATED lock requested.")
 
     def _on_clear_pcs(self) -> None:
         if not self._confirm("Confirm", "Clear PCS once/day lock?"):
             return
         with self._shared.lock:
             self._shared.gui.clear_lock_pcs = True
-        self._shared.event_log.log_info("• GUI: Clear PCS lock requested.")
+        _log_info(self._shared, "• GUI: Clear PCS lock requested.")
 
     # -------------------------------------------------------------------------
-    # Refresh loop
+    # Refresh loop (READ-ONLY UI updates only)
     # -------------------------------------------------------------------------
 
     def _refresh_all(self) -> None:
         self._refresh_realtime()
-        self._refresh_account()
+        self._refresh_account_readonly()
         self._refresh_event_and_status()
 
     def _refresh_realtime(self) -> None:
@@ -759,6 +798,7 @@ class MainWindow(QMainWindow):
             trades = list(self._shared.trades.values())
             go_flag = bool(self._shared.gui.go)
 
+        # GO checkbox is a control; safe to reflect runtime state (it is not a text entry).
         self._chk_go.blockSignals(True)
         self._chk_go.setChecked(go_flag)
         self._chk_go.blockSignals(False)
@@ -778,6 +818,7 @@ class MainWindow(QMainWindow):
         self._lbl_bars.setText(f"Bars since open: {len(snap.bars_1m)}")
         self._lbl_md_age.setText(f"MD heartbeat age: {_fmt_float(hb_age, 2)}s")
 
+        # Planned + active option keys
         rows: List[Tuple[str, Any]] = []
         if sp is not None and getattr(sp, "call", None) is not None:
             rows.append(("STRADDLE planned CALL", sp.call))
@@ -796,6 +837,7 @@ class MainWindow(QMainWindow):
                     continue
                 rows.append((f"ACTIVE {tr.strategy.value} leg={leg.leg_id}", leg.contract))
 
+        # Deduplicate
         seen = set()
         uniq: List[Tuple[str, Any]] = []
         for role, k in rows:
@@ -844,7 +886,6 @@ class MainWindow(QMainWindow):
 
     def _refresh_event_and_status(self) -> None:
         with self._shared.lock:
-            events = list(self._shared.event_log._rows)
             snap = self._shared.market
             trades = list(self._shared.trades.values())
             locks = dict(self._shared.day_locks)
@@ -852,10 +893,10 @@ class MainWindow(QMainWindow):
             acct_mode = self._shared.selected_account_mode
             acct_id = self._shared.selected_account_id
 
-        self._event_view.set_text_preserve_autoscroll("\n".join([row.text for row in events]))
+        self._event_view.set_text_preserve_autoscroll(_get_event_rows_text(self._shared))
 
         lines: List[str] = []
-        lines.append(f"Connected: {connected} | Account: {acct_mode} {acct_id}".strip())
+        lines.append(f"Connected: {connected} | Account: {acct_mode.value} {acct_id}".strip())
         if snap is not None:
             lines.append(
                 f"SPY last={_fmt_float(snap.spy_last,2)} vwap={_fmt_float(snap.spy_vwap,2)} "
@@ -869,10 +910,11 @@ class MainWindow(QMainWindow):
         lines.append(f"Active trades: {len(trades)}")
         self._status_view.setPlainText("\n".join(lines))
 
-    def _refresh_account(self) -> None:
-        # Keep widgets synced in case other code edits config live.
-        self._sync_account_widgets_from_config()
-
+    def _refresh_account_readonly(self) -> None:
+        """
+        READ-ONLY refresh for Account Balance tab.
+        NOTE: this must NEVER write into account config QLineEdits / mode selectors.
+        """
         with self._shared.lock:
             connected = bool(self._shared.ibkr_connected)
             acct_mode = self._shared.selected_account_mode
@@ -881,7 +923,7 @@ class MainWindow(QMainWindow):
             avail = self._shared.available_funds
             ledger = list(self._shared.ledger)
 
-        self._acct_status.setText(f"Account: connected={connected} mode={acct_mode} id={acct_id}")
+        self._acct_status.setText(f"Account: connected={connected} mode={acct_mode.value} id={acct_id}")
         self._acct_balances.setText(f"NetLiq={_fmt_float(netliq,2)}  AvailableFunds={_fmt_float(avail,2)}")
         self._ledger_view.setPlainText("\n".join([str(x) for x in ledger[-30:]]))
 
@@ -890,21 +932,20 @@ class MainWindow(QMainWindow):
 # SECTION: App entrypoint
 # =============================================================================
 
-def run_gui(shared: SharedState) -> int:
-    """Launch the GUI. Worker threads should be started by an external launcher."""
-    app = QApplication([])
-    win = MainWindow(shared)
-    win.resize(1500, 860)
-    win.show()
-    return app.exec()
-
-
 def _call_load_config() -> Any:
     """Support either load_config() or load_config(path)."""
     sig = inspect.signature(load_config)
     if len(sig.parameters) >= 1:
         return load_config(CONFIG_PATH)  # type: ignore[misc]
     return load_config()  # type: ignore[misc]
+
+
+def run_gui(shared: SharedState) -> int:
+    app = QApplication([])
+    win = MainWindow(shared)
+    win.resize(1500, 860)
+    win.show()
+    return app.exec()
 
 
 def main() -> int:
