@@ -273,6 +273,19 @@ class MarketSnapshot:
     bars_1m: Tuple[Bar1m, ...]  # since open
     option_quotes: Dict[OptionKey, OptionQuote]  # planned + active only
 
+    # 5-minute bars since open (built by MarketDataHub from real-time bars).
+    # These are monitored in parallel with 1-minute bars for entry triggers.
+    bars_5m: Tuple[Bar1m, ...] = ()
+
+    # Derived indicators (None when inputs unavailable).
+    # Note: VWAP/HOD/LOD are the single day-level truth and are computed from 1-minute bars.
+    rsi_1m_14: Optional[float] = None
+    sma_1m_10: Optional[float] = None
+    rsi_5m_14: Optional[float] = None
+    sma_5m_10: Optional[float] = None
+    pct_change_since_close: Optional[float] = None  # fraction; GUI may display percent
+    yesterday_close: Optional[float] = None
+    
     def heartbeat_age_s(self) -> float:
         return max(0.0, now_ts() - self.hub_heartbeat_ts)
 

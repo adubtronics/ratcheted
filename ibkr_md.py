@@ -142,6 +142,42 @@ class MarketDataProvider:
         raise NotImplementedError
 
 
+
+# =============================================================================
+# SECTION: Null provider (no data; disconnected-safe)
+# =============================================================================
+
+class NullMarketDataProvider(MarketDataProvider):
+    """Provider that never connects and returns no market data.
+
+    This is the default when no real IBKR adapter is available and the GUI
+    stub-market-data toggle is disabled. It prevents "random" data from being
+    published when the user is not connected to TWS/Gateway.
+    """
+
+    def __init__(self) -> None:
+        self._connected = False
+        self._requested: Set[OptionKey] = set()
+
+    def connect(self, shared: SharedState) -> None:
+        self._connected = False
+
+    def disconnect(self) -> None:
+        self._connected = False
+
+    def is_connected(self) -> bool:
+        return False
+
+    def update_requested_options(self, keys: Set[OptionKey]) -> None:
+        self._requested = set(keys)
+
+    def poll_underlying_spy_last(self) -> Optional[float]:
+        return None
+
+    def poll_option_quotes(self) -> Dict[OptionKey, OptionQuote]:
+        return {}
+
+
 # =============================================================================
 # SECTION: Stub provider (no external dependencies)
 # =============================================================================
@@ -514,6 +550,93 @@ class StubMarketDataProvider(MarketDataProvider):
         )
 
 
+
+# =============================================================================
+# SECTION: Bar aggregation + indicators
+# =============================================================================
+
+def _bars_to_5m(bars_1m: Tuple[Bar1m, ...]) -> Tuple[Bar1m, ...]:
+    """Aggregate 1-minute bars into 5-minute bars.
+
+    The returned bars use the same Bar1m dataclass for compactness. The `ts`
+    field is the start timestamp of the 5-minute bucket.
+    """
+    if not bars_1m:
+        return tuple()
+
+    out: List[Bar1m] = []
+    bucket: List[Bar1m] = []
+    current_bucket_ts: Optional[float] = None
+
+    for b in bars_1m:
+        bucket_ts = b.ts - (b.ts % 300.0)
+        if current_bucket_ts is None:
+            current_bucket_ts = bucket_ts
+        if bucket_ts != current_bucket_ts and bucket:
+            out.append(_reduce_bar_bucket(current_bucket_ts, bucket))
+            bucket = []
+            current_bucket_ts = bucket_ts
+        bucket.append(b)
+
+    if current_bucket_ts is not None and bucket:
+        out.append(_reduce_bar_bucket(current_bucket_ts, bucket))
+
+    return tuple(out)
+
+
+def _reduce_bar_bucket(bucket_ts: float, bars: List[Bar1m]) -> Bar1m:
+    """Reduce a list of 1-minute bars into a single bar."""
+    o = bars[0].open
+    h = max(x.high for x in bars)
+    l = min(x.low for x in bars)
+    c = bars[-1].close
+    # For aggregation, use the last bar's VWAP field as a simple representative.
+    vwap = bars[-1].vwap
+    return Bar1m(ts=bucket_ts, open=o, high=h, low=l, close=c, vwap=vwap)
+
+
+def _sma(closes: List[float], length: int) -> Optional[float]:
+    if length <= 0:
+        return None
+    if len(closes) < length:
+        return None
+    window = closes[-length:]
+    return sum(window) / float(length)
+
+
+def _rsi_wilder(closes: List[float], length: int) -> Optional[float]:
+    """Compute RSI using Wilder's smoothing.
+
+    Returns None when there is insufficient data.
+    """
+    if length <= 0:
+        return None
+    if len(closes) < length + 1:
+        return None
+
+    gains: List[float] = []
+    losses: List[float] = []
+    for i in range(1, length + 1):
+        chg = closes[i] - closes[i - 1]
+        gains.append(max(0.0, chg))
+        losses.append(max(0.0, -chg))
+
+    avg_gain = sum(gains) / float(length)
+    avg_loss = sum(losses) / float(length)
+
+    for i in range(length + 1, len(closes)):
+        chg = closes[i] - closes[i - 1]
+        gain = max(0.0, chg)
+        loss = max(0.0, -chg)
+        avg_gain = (avg_gain * (length - 1) + gain) / float(length)
+        avg_loss = (avg_loss * (length - 1) + loss) / float(length)
+
+    if avg_loss <= 0.0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
 # =============================================================================
 # SECTION: MarketDataHub (single owner/publisher)
 # =============================================================================
@@ -621,13 +744,24 @@ class MarketDataHub(threading.Thread):
         # Option quotes cache (latest known)
         self._option_quotes: Dict[OptionKey, OptionQuote] = {}
 
+        # 5-minute bar series derived from 1-minute bars (published in snapshot only).
+        self._bars_5m: Tuple[Bar1m, ...] = tuple()
+
+        # Yesterday close and derived % change since close (None when unavailable).
+        self._yesterday_close: Optional[float] = None
+
+        # One-line "missing data" episode logging flags.
+        self._episode_1m_indicators_missing = False
+        self._episode_5m_indicators_missing = False
+        self._episode_yclose_missing = False
+
     def _maybe_update_provider(self, cfg: Any) -> None:
         """Swap between NullMarketDataProvider and StubMarketDataProvider when toggled.
 
         Logs only on change. Disabling stub while using StubMarketDataProvider immediately
         stops synthetic prices by switching to NullMarketDataProvider.
         """
-        enabled = bool(getattr(getattr(cfg, "debug", None), "stub_market_data", False))
+        enabled = self._stub_md_enabled(cfg)
         if enabled == getattr(self, "_last_stub_md_enabled", None):
             return
         self._last_stub_md_enabled = enabled
@@ -649,8 +783,18 @@ class MarketDataHub(threading.Thread):
     def _stub_md_enabled(self, cfg: Any) -> bool:
         """Return True if stub/synthetic market data is enabled for this session.
 
-        This flag is intentionally *non-persistent*; GUI should not save it to disk.
+        Non-persistent rule:
+        - Prefer a GUI runtime flag (shared.gui.stub_market_data) when present.
+        - Fall back to config.debug.stub_market_data only if the GUI flag is absent.
         """
+        try:
+            with self._shared.lock:
+                gui = getattr(self._shared, "gui", None)
+                v = getattr(gui, "stub_market_data", None) if gui is not None else None
+            if isinstance(v, bool):
+                return v
+        except Exception:
+            pass
         try:
             dbg = getattr(cfg, "debug", None)
             return bool(getattr(dbg, "stub_market_data", False))
@@ -778,6 +922,34 @@ class MarketDataHub(threading.Thread):
             # Drop quotes for keys no longer requested to keep snapshot concise.
             self._option_quotes = {k: v for k, v in self._option_quotes.items() if k in req_keys}
 
+            bars_1m = tuple(self._bars)
+            bars_5m = _bars_to_5m(bars_1m)
+            closes_1m = [b.close for b in bars_1m]
+            closes_5m = [b.close for b in bars_5m]
+            rsi_1m_14 = _rsi_wilder(closes_1m, 14)
+            sma_1m_10 = _sma(closes_1m, 10)
+            rsi_5m_14 = _rsi_wilder(closes_5m, 14)
+            sma_5m_10 = _sma(closes_5m, 10)
+            yclose = self._yesterday_close
+            if yclose is None:
+                yclose = getattr(self._provider, 'yesterday_close', None)
+                if yclose is None and hasattr(self._provider, 'poll_yesterday_close'):
+                    try:
+                        yclose = self._provider.poll_yesterday_close()  # type: ignore[attr-defined]
+                    except Exception:
+                        yclose = None
+                if isinstance(yclose, (int, float)) and float(yclose) > 0.0:
+                    self._yesterday_close = float(yclose)
+                    yclose = self._yesterday_close
+            pct_change_since_close = None
+            if (spy_last is not None) and (yclose is not None) and (yclose > 0):
+                pct_change_since_close = (float(spy_last) - float(yclose)) / float(yclose)
+
+            # One-line episode logs for missing/returning indicator data.
+            self._log_episode_flags(rsi_1m_14 is None or sma_1m_10 is None, 'MD: 1m indicators unavailable', 'MD: 1m indicators restored', '_episode_1m_indicators_missing')
+            self._log_episode_flags(rsi_5m_14 is None or sma_5m_10 is None, 'MD: 5m indicators unavailable', 'MD: 5m indicators restored', '_episode_5m_indicators_missing')
+            self._log_episode_flags(yclose is None, 'MD: yesterday close unavailable', 'MD: yesterday close restored', '_episode_yclose_missing')
+
             snapshot = MarketSnapshot(
                 ts=now_ts(),
                 hub_heartbeat_ts=now_ts(),
@@ -785,7 +957,14 @@ class MarketDataHub(threading.Thread):
                 spy_vwap=self._vwap_running,
                 spy_hod=self._hod,
                 spy_lod=self._lod,
-                bars_1m=tuple(self._bars),
+                bars_1m=bars_1m,
+                bars_5m=bars_5m,
+                yesterday_close=yclose,
+                pct_change_since_close=pct_change_since_close,
+                rsi_1m_14=rsi_1m_14,
+                sma_1m_10=sma_1m_10,
+                rsi_5m_14=rsi_5m_14,
+                sma_5m_10=sma_5m_10,
                 option_quotes=dict(self._option_quotes),
             )
             self._publish(snapshot)
@@ -929,6 +1108,20 @@ class MarketDataHub(threading.Thread):
     # -------------------------------------------------------------------------
     # SECTION: Bar/VWAP/HOD/LOD maintenance
     # -------------------------------------------------------------------------
+
+
+    def _log_episode_flags(self, missing: bool, msg_missing: str, msg_restored: str, flag_attr: str) -> None:
+        """Log one-line transitions for missing/restored market inputs.
+
+        Ensures non-spammy behavior by logging only on change.
+        """
+        prior = bool(getattr(self, flag_attr, False))
+        if missing and not prior:
+            setattr(self, flag_attr, True)
+            self._shared.log_warn(msg_missing)
+        elif (not missing) and prior:
+            setattr(self, flag_attr, False)
+            self._shared.log_info(msg_restored)
 
     def _update_bars_and_levels(self, spy_last: float) -> None:
         now = now_ts()
