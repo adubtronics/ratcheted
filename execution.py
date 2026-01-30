@@ -151,7 +151,7 @@ class ExecutionEngine:
         This is intended to run in its own daemon thread.
         Tick pacing is controlled by config.execution_tick_s.
         """
-        self._shared.event_log.log_info("Execution: Starting")
+        self._shared.log_info("Execution: Starting")
         while not self._shutdown_event.is_set():
             tick_start = time.monotonic()
             self._tick_id += 1
@@ -185,7 +185,7 @@ class ExecutionEngine:
             if remaining > 0:
                 time.sleep(min(remaining, 0.05))
 
-        self._shared.event_log.log_info("Execution: Stopped")
+        self._shared.log_info("Execution: Stopped")
         # Final safety flatten
         self._flatten_all()
 
@@ -226,7 +226,7 @@ class ExecutionEngine:
             return
 
         if run_mode == RunMode.REAL and not connected:
-            self._shared.event_log.log_warn("• REAL entry blocked: IBKR not connected.")
+            self._shared.log_warn("• REAL entry blocked: IBKR not connected.")
             return
 
 
@@ -236,13 +236,13 @@ class ExecutionEngine:
         # Enforce budget guard at consumption time (protects against stale upstream sizing).
         budget_usd = self._budget_usd_for_strategy(intent.strategy, available_funds)
         if budget_usd <= 0.0:
-            self._shared.event_log.log_warn(
+            self._shared.log_warn(
                 f"• Entry blocked: budget is 0 for {intent.strategy.value}."
             )
             return
 
         if float(intent.max_cost) > budget_usd:
-            self._shared.event_log.log_warn(
+            self._shared.log_warn(
                 f"• Entry blocked: intent cost ${float(intent.max_cost):.2f} exceeds budget ${budget_usd:.2f} "
                 f"for {intent.strategy.value}."
             )
@@ -254,7 +254,7 @@ class ExecutionEngine:
         with self._shared.lock:
             self._shared.trades[trade_id] = trade
 
-        self._shared.event_log.log_info(
+        self._shared.log_info(
             f"• Intent accepted: ENTER {intent.strategy.value} channel={intent.channel.value}"
         )
 
@@ -296,7 +296,7 @@ class ExecutionEngine:
             leg.state = LegState.ENTERING
             leg.sm_guard.mark_transition(self._tick_id)
 
-            self._shared.event_log.log_info(
+            self._shared.log_info(
                 f"• Order submitted ({trade.strategy.value}) leg={leg.leg_id} "
                 f"qty={leg.qty} limit={wo.limit_price:.2f}"
             )
@@ -362,7 +362,7 @@ class ExecutionEngine:
             # Timeout handling
             if now - wo.submitted_ts >= timeout_s:
                 wo.cancelled = True
-                self._shared.event_log.log_warn(
+                self._shared.log_warn(
                     f"• Entry timeout: cancelling order {oid}"
                 )
 
@@ -385,7 +385,7 @@ class ExecutionEngine:
         leg.state = LegState.OPEN
         leg.sm_guard.mark_transition(self._tick_id)
 
-        self._shared.event_log.log_info(
+        self._shared.log_info(
             f"• Fill: trade={trade_id} leg={leg_id} "
             f"qty={leg.filled_qty} price={fill_price:.2f}"
         )
@@ -434,7 +434,7 @@ class ExecutionEngine:
             if pnl_pct <= soft and not leg.hang_active:
                 leg.hang_active = True
                 leg.hang_start_ts = now_ts()
-                self._shared.event_log.log_warn(
+                self._shared.log_warn(
                     f"• Soft stop poked: enabling hang leg={leg.leg_id}"
                 )
 
@@ -454,7 +454,7 @@ class ExecutionEngine:
         for threshold, lock_level in ladder:
             if pnl_pct >= threshold and leg.stop_lock_pct < lock_level:
                 leg.stop_lock_pct = lock_level
-                self._shared.event_log.log_info(
+                self._shared.log_info(
                     f"• Ratchet: leg={leg.leg_id} lock={lock_level:.2f}"
                 )
 
@@ -480,7 +480,7 @@ class ExecutionEngine:
         leg.state = LegState.EXITING
         leg.sm_guard.mark_transition(self._tick_id)
 
-        self._shared.event_log.log_warn(
+        self._shared.log_warn(
             f"• Exit leg={leg.leg_id} reason={reason}"
         )
 
@@ -492,7 +492,7 @@ class ExecutionEngine:
         if all(l.state == LegState.CLOSED for l in trade.legs):
             trade.state = TradeState.CLOSED
             trade.sm_guard.mark_transition(self._tick_id)
-            self._shared.event_log.log_info(
+            self._shared.log_info(
                 f"• Trade closed trade_id={trade.trade_id}"
             )
 
@@ -504,20 +504,20 @@ class ExecutionEngine:
         if self._flattening:
             return
         self._flattening = True
-        self._shared.event_log.log_warn("Flatten: Start")
+        self._shared.log_warn("Flatten: Start")
         """
         Flatten all open trades immediately.
 
         This ignores go and is always processed first on shutdown.
         """
-        self._shared.event_log.log_warn("• Shutdown flatten start.")
+        self._shared.log_warn("• Shutdown flatten start.")
         for trade in list(self._shared.trades.values()):
             for leg in trade.legs:
                 if leg.state == LegState.OPEN:
                     self._exit_leg(trade, leg, reason="SHUTDOWN FLATTEN")
-        self._shared.event_log.log_warn("• Shutdown flatten complete.")
+        self._shared.log_warn("• Shutdown flatten complete.")
 
-        self._shared.event_log.log_warn("Flatten: Done")
+        self._shared.log_warn("Flatten: Done")
         self._flattening = False
 
     def _is_shutdown_pressed(self) -> bool:

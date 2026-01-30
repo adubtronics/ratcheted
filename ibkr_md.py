@@ -298,13 +298,13 @@ class MarketDataHub(threading.Thread):
         - Poll provider quickly; never block long.
         - Publish MarketSnapshot every tick.
         """
-        self._shared.event_log.log_info("MD: Starting")
+        self._shared.log_info("MD: Starting")
         while True:
             # Heartbeat for GUI diagnostics (updated every tick).
             with self._shared.lock:
                 self._shared.md_heartbeat_ts = time.time()
             if _should_stop(self._shared):
-                self._shared.event_log.log_info("MD: Stopped")
+                self._shared.log_info("MD: Stopped")
                 return
             tick_start = time.monotonic()
             cfg, run_mode, acct_mode, acct_id, tick_s = self._snapshot_config()
@@ -314,7 +314,7 @@ class MarketDataHub(threading.Thread):
             if require_id and (acct_id or "").strip() == "":
                 if not self._no_acct_id_episode:
                     self._no_acct_id_episode = True
-                    self._shared.event_log.log_warn(
+                    self._shared.log_warn(
                         f"IBKR: Not connecting (account id missing) mode={acct_mode} run_mode={run_mode}"
                     )
             else:
@@ -416,12 +416,12 @@ class MarketDataHub(threading.Thread):
                         if acct_mode == AccountMode.PAPER
                         else self._shared.config.account.live_account_id
                     )
-                self._shared.event_log.log_info(
+                self._shared.log_info(
                     f"IBKR: Connecting (mode={acct_mode.value}, account_id={'set' if (acct_id or '').strip() else 'missing'})"
                 )
             except Exception:
                 # If config cannot be read, still attempt connect; provider will handle errors.
-                self._shared.event_log.log_info("IBKR: Connecting")
+                self._shared.log_info("IBKR: Connecting")
 
             try:
                 self._provider.connect(self._shared)
@@ -433,12 +433,12 @@ class MarketDataHub(threading.Thread):
                         if self._shared.config.account.mode == AccountMode.PAPER
                         else self._shared.config.account.live_account_id
                     )
-                self._shared.event_log.log_info("IBKR: Connected")
+                self._shared.log_info("IBKR: Connected")
                 self._set_conn_state(True, "")
             except Exception as e:
                 with self._shared.lock:
                     self._shared.ibkr_connected = False
-                self._shared.event_log.log_warn(f"IBKR: Connect failed: {e!r}")
+                self._shared.log_warn(f"IBKR: Connect failed: {e!r}")
                 self._set_conn_state(False, str(e))
 
         elif (not should_connect) and currently:
@@ -448,7 +448,7 @@ class MarketDataHub(threading.Thread):
                 pass
             with self._shared.lock:
                 self._shared.ibkr_connected = False
-            self._shared.event_log.log_info("IBKR: Disconnected (account id missing or mode changed)")
+            self._shared.log_info("IBKR: Disconnected (account id missing or mode changed)")
 
 
     # -------------------------------------------------------------------------
