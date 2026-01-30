@@ -15,6 +15,7 @@ Python: 3.10.4
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import threading
@@ -37,6 +38,13 @@ _ET = ZoneInfo("America/New_York")
 def now_ts() -> float:
     """Return current wall-clock timestamp (seconds since epoch)."""
     return time.time()
+
+
+def fmt_ts_et(ts: float) -> str:
+    """Format a Unix timestamp in Eastern Time as MM/DD/YYYY HH:MM:SS.MMM AM/PM."""
+    dt = datetime.datetime.fromtimestamp(float(ts), tz=_ET)
+    ms = int(dt.microsecond / 1000)
+    return dt.strftime("%m/%d/%Y %I:%M:%S") + f".{ms:03d} " + dt.strftime("%p")
 
 
 def now_et_hhmm() -> str:
@@ -462,6 +470,10 @@ class EventRow:
     ts: float
     level: LogLevel
     text: str
+
+    def ts_str(self) -> str:
+        """Return the event timestamp formatted for GUI display."""
+        return fmt_ts_et(self.ts)
 
 
 @dataclass

@@ -25,6 +25,8 @@ import inspect
 from decimal import Decimal, ROUND_HALF_UP
 from dataclasses import fields, is_dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import time
+from datetime import datetime
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
@@ -385,6 +387,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self, shared: SharedState) -> None:
         super().__init__()
+        self._boot_logged = False
+        self._last_connected: Optional[bool] = None
         self._shared = shared
         self.setWindowTitle("IBKR Trading Bot GUI")
 
@@ -1120,6 +1124,158 @@ class MainWindow(QMainWindow):
 # =============================================================================
 # SECTION: GUI Entrypoint
 # =============================================================================
+
+def _safe_getattr(obj: object, name: str, default: object = None) -> object:
+    """Safely read an attribute without raising exceptions."""
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return default
+
+
+def _infer_connected(shared: "SharedState") -> bool:
+    """
+    Best-effort IBKR connectivity inference.
+
+    Preference order:
+    1) Explicit boolean flags (shared.ibkr_connected, shared.connected, shared.ibkr.connected, shared.md.connected)
+    2) MarketDataHub heartbeat recency if available
+    """
+    with shared.lock:
+        for attr in ("ibkr_connected", "connected", "is_connected"):
+            v = _safe_getattr(shared, attr, None)
+            if isinstance(v, bool):
+                return v
+
+        ibkr = _safe_getattr(shared, "ibkr", None)
+        if ibkr is not None:
+            for attr in ("connected", "is_connected"):
+                v = _safe_getattr(ibkr, attr, None)
+                if isinstance(v, bool):
+                    return v
+
+        md = _safe_getattr(shared, "md", None)
+        if md is not None:
+            for attr in ("connected", "is_connected"):
+                v = _safe_getattr(md, attr, None)
+                if isinstance(v, bool):
+                    return v
+
+        snap = _safe_getattr(shared, "market", None) or _safe_getattr(shared, "latest_market", None) or _safe_getattr(shared, "market_snapshot", None)
+        hb_ts = None
+        if snap is not None:
+            hb_ts = _safe_getattr(snap, "heartbeat_ts", None) or _safe_getattr(snap, "heartbeat", None)
+        if isinstance(hb_ts, (int, float)):
+            return (time.time() - float(hb_ts)) <= 10.0
+    return False
+
+
+
+
+def _fmt_ts(ts: object) -> str:
+    """Format a unix timestamp as MM/DD/YYYY HH:MM:SS.MMM AM/PM."""
+    if not isinstance(ts, (int, float)):
+        return "N/A"
+    dt = datetime.datetime.fromtimestamp(float(ts))
+    ms = int(dt.microsecond / 1000)
+    return dt.strftime("%m/%d/%Y %I:%M:%S") + f".{ms:03d} " + dt.strftime("%p")
+def _fmt_age_s(ts: object, now: float) -> str:
+    """Format age in seconds from a unix timestamp."""
+    if not isinstance(ts, (int, float)):
+        return "N/A"
+    age = max(0.0, now - float(ts))
+    return f"{age:.1f}s"
+
+
+def _build_status_report(shared: "SharedState") -> str:
+    """Build a deterministic multi-section status report for the Real Time tab."""
+    now = time.time()
+    with shared.lock:
+        cfg = shared.config
+        go = bool(_safe_getattr(shared.gui, "go", False)) if _safe_getattr(shared, "gui", None) is not None else bool(_safe_getattr(shared, "go", False))
+        debug_mode = bool(_safe_getattr(shared.gui, "debug_mode", False)) if _safe_getattr(shared, "gui", None) is not None else bool(_safe_getattr(shared, "debug_mode", False))
+
+        # Heartbeats (best-effort; absent fields render as N/A).
+        hb_md = _safe_getattr(shared, "md_heartbeat_ts", None) or _safe_getattr(shared, "market_heartbeat_ts", None)
+        hb_plan = _safe_getattr(shared, "planner_heartbeat_ts", None)
+        hb_strad = _safe_getattr(shared, "straddle_supervisor_heartbeat_ts", None)
+        hb_pcs = _safe_getattr(shared, "pcs_supervisor_heartbeat_ts", None)
+        hb_exec = _safe_getattr(shared, "execution_heartbeat_ts", None)
+
+        # Market snapshot summary (best-effort).
+        snap = _safe_getattr(shared, "market", None) or _safe_getattr(shared, "latest_market", None) or _safe_getattr(shared, "market_snapshot", None)
+        spy_last = _safe_getattr(snap, "spy_last", None)
+        spy_vwap = _safe_getattr(snap, "spy_vwap", None)
+        spy_hod = _safe_getattr(snap, "spy_hod", None)
+        spy_lod = _safe_getattr(snap, "spy_lod", None)
+        bars = _safe_getattr(snap, "bars_since_open", None) or _safe_getattr(snap, "bars_count", None)
+        hb_snap = _safe_getattr(snap, "heartbeat_ts", None) or _safe_getattr(snap, "heartbeat", None)
+
+        # Gate/channel states
+        gate = _safe_getattr(shared, "gate", None) or _safe_getattr(shared, "straddle_gate", None)
+        gate_state = _safe_getattr(gate, "state", None)
+        gate_type = _safe_getattr(gate, "selected", None) or _safe_getattr(shared, "gate_type", None)
+        armable = _safe_getattr(shared, "gate_armable", None)
+        armed = _safe_getattr(shared, "gate_armed", None)
+
+        locks = _safe_getattr(shared, "day_locks", None)
+        # Active trades
+        trades = _safe_getattr(shared, "trades", None) or _safe_getattr(shared, "active_trades", None)
+
+    lines = []
+    lines.append("SYSTEM")
+    lines.append(f"  go={go}  debug={debug_mode}  mode={_safe_getattr(cfg.account, 'mode', 'N/A')}")
+    lines.append(f"  connected={_infer_connected(shared)}")
+
+    lines.append("")
+    lines.append("THREAD HEARTBEATS")
+    lines.append(f"  md_hb_time={_fmt_ts(hb_md or hb_snap)}")
+    lines.append(f"  exec_hb_time={_fmt_ts(hb_exec)}")
+    lines.append(f"  md_hb_age={_fmt_age_s(hb_md or hb_snap, now)}  planner_hb_age={_fmt_age_s(hb_plan, now)}")
+    lines.append(f"  straddle_hb_age={_fmt_age_s(hb_strad, now)}  pcs_hb_age={_fmt_age_s(hb_pcs, now)}  exec_hb_age={_fmt_age_s(hb_exec, now)}")
+
+    lines.append("")
+    lines.append("MARKET DATA")
+    lines.append(f"  SPY last={spy_last if spy_last is not None else 'N/A'}  vwap={spy_vwap if spy_vwap is not None else 'N/A'}  hod={spy_hod if spy_hod is not None else 'N/A'}  lod={spy_lod if spy_lod is not None else 'N/A'}")
+    lines.append(f"  bars_since_open={bars if bars is not None else 'N/A'}  md_heartbeat_age={_fmt_age_s(hb_snap, now)}")
+
+    lines.append("")
+    lines.append("GATE / CHANNELS")
+    lines.append(f"  gate_type={gate_type if gate_type is not None else 'N/A'}  gate_state={gate_state if gate_state is not None else 'N/A'}  armable={armable if armable is not None else 'N/A'}  armed={armed if armed is not None else 'N/A'}")
+
+    lines.append("")
+    lines.append("DAY LOCKS")
+    if locks is None:
+        lines.append("  N/A")
+    else:
+        # Try common lock attributes.
+        for name in ("straddle_timed_lock", "straddle_gated_lock", "pcs_lock"):
+            v = _safe_getattr(locks, name, None)
+            if isinstance(v, bool):
+                lines.append(f"  {name}={v}")
+        if len(lines) == 0:
+            lines.append("  (no lock fields detected)")
+
+    lines.append("")
+    lines.append("ACTIVE TRADES")
+    if isinstance(trades, dict) and trades:
+        for tid, tr in trades.items():
+            t_state = _safe_getattr(tr, "state", None) or _safe_getattr(tr, "sm_state", None)
+            strat = _safe_getattr(tr, "strategy", None)
+            chan = _safe_getattr(tr, "channel", None)
+            lines.append(f"  {tid}: strategy={strat} channel={chan} state={t_state}")
+            legs = _safe_getattr(tr, "legs", None)
+            if isinstance(legs, dict):
+                for lname, leg in legs.items():
+                    l_state = _safe_getattr(leg, "state", None) or _safe_getattr(leg, "sm_state", None)
+                    hang = _safe_getattr(leg, "hang_active", None)
+                    hang_age = _safe_getattr(leg, "hang_elapsed_s", None)
+                    lines.append(f"    leg {lname}: state={l_state} hang={hang} hang_elapsed_s={hang_age if hang_age is not None else 'N/A'}")
+    else:
+        lines.append("  (none)")
+
+    return "\n".join(lines)
+
 
 def _call_load_config() -> Any:
     """Support either load_config() or load_config(path)."""
