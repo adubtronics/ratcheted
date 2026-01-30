@@ -39,6 +39,7 @@ from zoneinfo import ZoneInfo
 
 from core import (
     AccountMode,
+    BudgetMode,
     DayLockType,
     EntryIntent,
     GateRuntime,
@@ -55,24 +56,6 @@ from core import (
     TriggerChannel,
     now_ts,
 )
-
-# =============================================================================
-# SECTION: Shutdown helpers
-# =============================================================================
-
-def _should_stop(shared: "SharedState") -> bool:
-    """Return True when any shutdown signal is active."""
-    try:
-        with shared.lock:
-            if getattr(shared.gui, "shutdown_pressed", False):
-                return True
-    except Exception:
-        pass
-    ev = getattr(shared, "shutdown_event", None)
-    if isinstance(ev, threading.Event) and ev.is_set():
-        return True
-    return False
-
 
 
 # =============================================================================
@@ -533,7 +516,7 @@ def _spread_filter_ok(
             all_ok = False
             shared.log_spread_episode_start(
                 key=f"{episode_key_prefix}:{idx}:MISSING",
-                text=f"• Spread filter blocked (missing quote) for {k.symbol} {k.expiry} {k.right}{k.strike}.",
+                text=f"Spread filter blocked (missing quote) for {k.symbol} {k.expiry} {k.right}{k.strike}.",
                 cooldown_s=30.0,
             )
             continue
@@ -542,7 +525,7 @@ def _spread_filter_ok(
             all_ok = False
             shared.log_spread_episode_start(
                 key=f"{episode_key_prefix}:{idx}:NOMID",
-                text=f"• Spread filter blocked (no mid) for {k.symbol} {k.expiry} {k.right}{k.strike} bid={q.bid} ask={q.ask}.",
+                text=f"Spread filter blocked (no mid) for {k.symbol} {k.expiry} {k.right}{k.strike} bid={q.bid} ask={q.ask}.",
                 cooldown_s=30.0,
             )
             continue
@@ -551,7 +534,7 @@ def _spread_filter_ok(
             shared.log_spread_episode_start(
                 key=f"{episode_key_prefix}:{idx}:WIDE",
                 text=(
-                    "• Spread filter blocked (wide spread) "
+                    "Spread filter blocked (wide spread) "
                     f"{k.symbol} {k.expiry} {k.right}{k.strike}: "
                     f"bid={q.bid} ask={q.ask} mid={_safe_mid(q)} spread%={spr_pct:.6f} limit={max_spread_pct:.6f}"
                 ),
@@ -562,7 +545,7 @@ def _spread_filter_ok(
             shared.log_spread_episode_end(
                 key=f"{episode_key_prefix}:{idx}:WIDE",
                 text=(
-                    f"• Spread episode recovered for {k.symbol} {k.expiry} {k.right}{k.strike} "
+                    f"Spread episode recovered for {k.symbol} {k.expiry} {k.right}{k.strike} "
                     f"spread%={spr_pct:.6f}."
                 ),
             )
@@ -576,53 +559,85 @@ def _compute_straddle_qtys(
     call_key: OptionKey,
     put_key: OptionKey,
 ) -> Tuple[Tuple[int, int], float]:
-    """Compute (call_qty, put_qty) and max_cost budget based on available funds."""
-    budget = max(0.0, float(cfg.straddle.budget_pct_available_funds) * float(shared_available_funds))
-    # In triggers, we only size; execution computes working prices.
-    # Use ask as conservative working limit proxy.
+    """
+    Compute (call_qty, put_qty) and strategy budget (USD).
+
+    Budget selection (Option B):
+    - If cfg.straddle.budget_mode == PCT_AVAILABLE_FUNDS, budget = pct_available_funds * AvailableFunds.
+    - If cfg.straddle.budget_mode == FIXED_USD, budget = fixed_budget_usd.
+
+    Notes:
+    - This sizing uses ask as a conservative proxy for the working limit price.
+    - Execution is the final authority: it must enforce per-leg budget caps on any repricing.
+    """
+    mode = getattr(cfg.straddle, "budget_mode", BudgetMode.PCT_AVAILABLE_FUNDS)
+    if mode == BudgetMode.FIXED_USD:
+        budget = max(0.0, float(getattr(cfg.straddle, "fixed_budget_usd", 0.0)))
+    else:
+        budget = max(0.0, float(getattr(cfg.straddle, "budget_pct_available_funds", 0.0)) * float(shared_available_funds))
+
     call_q = snap.option_quotes.get(call_key)
     put_q = snap.option_quotes.get(put_key)
     call_ask = call_q.ask if (call_q is not None and call_q.ask is not None) else None
     put_ask = put_q.ask if (put_q is not None and put_q.ask is not None) else None
     if call_ask is None or put_ask is None:
         return (0, 0), budget
-    call_cap = budget * float(cfg.straddle.leg_cap_pct_each)
-    put_cap = budget * float(cfg.straddle.leg_cap_pct_each)
-    call_qty = int(max(0.0, math.floor(call_cap / (call_ask * 100.0))))
-    put_qty = int(max(0.0, math.floor(put_cap / (put_ask * 100.0))))
-    return (call_qty, put_qty), budget
 
+    leg_cap = max(0.0, float(getattr(cfg.straddle, "leg_cap_pct_each", 0.0)))
+    call_cap = budget * leg_cap
+    put_cap = budget * leg_cap
+
+    call_qty = int(max(0.0, math.floor(call_cap / (float(call_ask) * 100.0))))
+    put_qty = int(max(0.0, math.floor(put_cap / (float(put_ask) * 100.0))))
+    return (call_qty, put_qty), budget
 
 def _compute_pcs_qtys(
     snap: MarketSnapshot,
     cfg,
+    shared_available_funds: float,
     short_key: OptionKey,
     long_key: OptionKey,
-) -> Tuple[int, float, float]:
-    """Compute PCS qty using credit estimate and budget rule."""
+) -> Tuple[int, float, float, float]:
+    """
+    Compute PCS qty and credit values.
+
+    Returns:
+        (qty, credit_per_spread, credit_total, budget)
+
+    Budget selection (Option B):
+    - If cfg.pcs.budget_mode == PCT_AVAILABLE_FUNDS, budget = pct_available_funds * AvailableFunds.
+    - If cfg.pcs.budget_mode == FIXED_USD, budget = fixed_budget.
+
+    Budget sizing rule:
+        qty * credit_total_one * budget_credit_mult <= budget
+    where:
+        credit_total_one = credit_per_spread * 100
+    """
     short_q = snap.option_quotes.get(short_key)
     long_q = snap.option_quotes.get(long_key)
     if short_q is None or long_q is None:
-        return 0, 0.0, 0.0
+        return 0, 0.0, 0.0, 0.0
     short_mid = _safe_mid(short_q)
     long_mid = _safe_mid(long_q)
     if short_mid is None or long_mid is None:
-        return 0, 0.0, 0.0
+        return 0, 0.0, 0.0, 0.0
+
     credit_per_spread = max(0.0, float(short_mid) - float(long_mid))
     credit_total_one = credit_per_spread * 100.0
     if credit_total_one <= 0:
-        return 0, credit_per_spread, 0.0
-    budget = float(cfg.pcs.fixed_budget)
-    mult = float(cfg.pcs.budget_credit_mult)
-    q = int(max(0.0, math.floor(budget / (mult * credit_total_one))))
+        return 0, credit_per_spread, 0.0, 0.0
+
+    mode = getattr(cfg.pcs, "budget_mode", BudgetMode.FIXED_USD)
+    if mode == BudgetMode.PCT_AVAILABLE_FUNDS:
+        budget = max(0.0, float(getattr(cfg.pcs, "budget_pct_available_funds", 0.0)) * float(shared_available_funds))
+    else:
+        budget = max(0.0, float(getattr(cfg.pcs, "fixed_budget", 0.0)))
+
+    mult = max(0.0, float(getattr(cfg.pcs, "budget_credit_mult", 0.0)))
+    denom = max(1e-9, mult * credit_total_one)
+    q = int(max(0.0, math.floor(budget / denom)))
     credit_total = credit_total_one * q
-    return q, credit_per_spread, credit_total
-
-
-# =============================================================================
-# SECTION: STRADDLE Trigger Supervisor
-# =============================================================================
-
+    return q, credit_per_spread, credit_total, budget
 
 class StraddleTriggerSupervisor(threading.Thread):
     """Maintains STRADDLE channels and emits EntryIntents only."""
@@ -634,12 +649,7 @@ class StraddleTriggerSupervisor(threading.Thread):
         self._tick_id = 0
 
     def run(self) -> None:
-        while True:
-            # Heartbeat for GUI diagnostics
-            with self._shared.lock:
-                setattr(self._shared, "straddle_supervisor_heartbeat_ts", time.time())
-            if _should_stop(self._shared):
-                return
+        while not self._shared.shutdown_event.is_set():
             t0 = time.monotonic()
             try:
                 self._tick_id += 1
@@ -944,17 +954,92 @@ class StraddleTriggerSupervisor(threading.Thread):
                 gr.last_transition_ts = now_ts()
                 self._shared.log_info(f"Gate state -> BLOCKED ({reason}).")
 
+    
+    def _compute_pass_for_bars(
+        self,
+        selected: GateType,
+        bars: List[Any],
+        day_vwap: Optional[float],
+        day_hod: Optional[float],
+        day_lod: Optional[float],
+    ) -> bool:
+        """
+        Evaluate PASS conditions for the *selected* gate type on an arbitrary bar stream.
+
+        Notes:
+        - Gate selection (Bull/Bear/Neutral) remains a 1-minute truth computed by evaluate_straddle_gate().
+        - PASS may be satisfied by either 1-minute bars or 5-minute bars; this helper allows the same
+          PASS logic to be evaluated on both streams without duplicating day-level truths.
+        - day_vwap/day_hod/day_lod are canonical session truths published by MarketDataHub.
+        """
+        if selected == GateType.NONE:
+            return False
+        if not bars:
+            return False
+        last_close = getattr(bars[-1], "close", None)
+        if not isinstance(last_close, (int, float)):
+            return False
+
+        # Bull/Bear PASS: bar close within 0.01% of VWAP (abs(dev) <= 0.0001).
+        if selected in (GateType.BULL, GateType.BEAR):
+            if not isinstance(day_vwap, (int, float)) or day_vwap == 0:
+                return False
+            dev = (float(last_close) - float(day_vwap)) / float(day_vwap)
+            return abs(dev) <= 0.0001
+
+        # Neutral PASS: two-bar sequence evaluated on the supplied timeframe:
+        # bar0 close within 0.00015 of HOD/LOD OR creates new HOD/LOD; bar1 close within 0.00005 of bar0 close
+        if selected == GateType.NEUTRAL:
+            if len(bars) < 2:
+                return False
+            bar0 = bars[-2]
+            bar1 = bars[-1]
+            c0 = getattr(bar0, "close", None)
+            c1 = getattr(bar1, "close", None)
+            if not isinstance(c0, (int, float)) or not isinstance(c1, (int, float)):
+                return False
+
+            # Use canonical day HOD/LOD for "near extremum" checks.
+            hod = float(day_hod) if isinstance(day_hod, (int, float)) else None
+            lod = float(day_lod) if isinstance(day_lod, (int, float)) else None
+            c0f = float(c0)
+            c1f = float(c1)
+
+            near_hod = (hod is not None) and (abs(c0f - hod) <= 0.00015 * max(1.0, hod))
+            near_lod = (lod is not None) and (abs(c0f - lod) <= 0.00015 * max(1.0, lod))
+            makes_new_hod = (hod is not None) and (c0f >= hod)
+            makes_new_lod = (lod is not None) and (c0f <= lod)
+            cond0 = near_hod or near_lod or makes_new_hod or makes_new_lod
+            cond1 = abs(c1f - c0f) <= 0.00005 * max(1.0, abs(c0f))
+            return bool(cond0 and cond1)
+
+        return False
+
     def _update_gate_runtime(self, tick_id: int, cfg, snap: MarketSnapshot, gui, locks: Dict[str, bool], gate_rt: GateRuntime) -> None:
         ge = evaluate_straddle_gate(snap, cfg)
         selected = ge.selected
         armable = selected != GateType.NONE
-        passed = False
+
+        # PASS evaluation: satisfied if either 1-minute or 5-minute timeframe PASS is true.
+        # PASS_1m is computed by evaluate_straddle_gate() from the 1-minute truth stream.
+        pass_1m = False
         if selected == GateType.BULL:
-            passed = ge.bull_pass
+            pass_1m = ge.bull_pass
         elif selected == GateType.BEAR:
-            passed = ge.bear_pass
+            pass_1m = ge.bear_pass
         elif selected == GateType.NEUTRAL:
-            passed = ge.neutral_pass
+            pass_1m = ge.neutral_pass
+
+        with self._shared.lock:
+            bars_5m = list(getattr(self._shared, 'bars_5m', []))
+        pass_5m = self._compute_pass_for_bars(
+            selected=selected,
+            bars=bars_5m,
+            day_vwap=snap.spy_vwap,
+            day_hod=snap.spy_hod,
+            day_lod=snap.spy_lod,
+        )
+        passed = bool(pass_1m or pass_5m)
 
         with self._shared.lock:
             gr = self._shared.gate_by_channel[TriggerChannel.GATED.value]
@@ -1008,16 +1093,6 @@ class StraddleTriggerSupervisor(threading.Thread):
                     gr.armed = False
 
             # Logging (infrequent events only)
-            if prev_state != gr.state:
-                self._shared.log_info(f"Gate state -> {gr.state.value}.")
-            if prev_armable != gr.armable:
-                if gr.armable:
-                    self._shared.log_info(f"Gate became ARMABLE ({gr.selected_gate.value}).")
-                else:
-                    self._shared.log_info("Gate no longer ARMABLE.")
-            if prev_armed != gr.armed and gr.armed:
-                self._shared.log_info("Gate ARMED.")
-
             if prev_sel != gr.selected_gate:
                 self._shared.log_info(f"Gate selected: {gr.selected_gate.value}.")
             if prev_armable != gr.armable and gr.armable:
@@ -1029,6 +1104,12 @@ class StraddleTriggerSupervisor(threading.Thread):
                 self._shared.log_info("Gate -> ARMED.")
             if prev_state != gr.state:
                 self._shared.log_info(f"Gate state transition: {prev_state.value} -> {gr.state.value}.")
+                if gr.state == GateState.PASS:
+                    # If both timeframes satisfy PASS on the same scan tick, log both with no preference.
+                    if pass_1m:
+                        self._shared.log_info("Gate PASS satisfied on 1m bars.")
+                    if pass_5m:
+                        self._shared.log_info("Gate PASS satisfied on 5m bars.")
 
 
 # =============================================================================
@@ -1046,12 +1127,7 @@ class PCSTriggerSupervisor(threading.Thread):
         self._tick_id = 0
 
     def run(self) -> None:
-        while True:
-            # Heartbeat for GUI diagnostics
-            with self._shared.lock:
-                setattr(self._shared, "pcs_supervisor_heartbeat_ts", time.time())
-            if _should_stop(self._shared):
-                return
+        while not self._shared.shutdown_event.is_set():
             t0 = time.monotonic()
             try:
                 self._tick_id += 1
@@ -1074,6 +1150,7 @@ class PCSTriggerSupervisor(threading.Thread):
             lock_pcs = bool(self._shared.day_locks.get(DayLockType.PCS.value, False))
             trades = list(self._shared.trades.values())
             ibkr_connected = self._shared.ibkr_connected
+            available_funds = float(self._shared.available_funds)
 
         # Clear-lock request
         with self._shared.lock:
@@ -1134,7 +1211,7 @@ class PCSTriggerSupervisor(threading.Thread):
         ):
             return
 
-        pcs_qty, credit_per, credit_total = _compute_pcs_qtys(snap, cfg, plan.short_put, plan.long_put)
+        pcs_qty, credit_per, credit_total, budget = _compute_pcs_qtys(snap, cfg, available_funds, plan.short_put, plan.long_put)
         if pcs_qty <= 0:
             return
 
@@ -1157,7 +1234,7 @@ class PCSTriggerSupervisor(threading.Thread):
             channel=None,
             legs=tuple(legs),
             qtys=tuple(qtys),
-            max_cost=float(cfg.pcs.fixed_budget),
+            max_cost=float(budget),
             deadline_ts=float(_parse_hhmm_et_to_ts_today(cfg.pcs.deadline_time_et)),
         )
         self._q.put(intent)

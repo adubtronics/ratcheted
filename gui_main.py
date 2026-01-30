@@ -336,83 +336,46 @@ def _parse_percent(txt: str) -> Optional[float]:
 
 
 def _log_info(shared: SharedState, msg: str) -> None:
-    if hasattr(shared, "event_log") and hasattr(shared.event_log, "log_info"):
-        shared.event_log.log_info(msg)
-        return
-    if hasattr(shared, "log_info"):
-        shared.log_info(msg)  # type: ignore[attr-defined]
+    """Log an informational event via SharedState (thread-safe)."""
+    try:
+        shared.log_info(msg)
+    except Exception:
+        # Last-resort: attempt direct EventLog add if SharedState helpers unavailable.
+        try:
+            from core import LogLevel  # local import to avoid circularity issues
+            shared.event_log.add(LogLevel.INFO, msg)
+        except Exception:
+            return
 
 
 def _log_warn(shared: SharedState, msg: str) -> None:
-    if hasattr(shared, "event_log") and hasattr(shared.event_log, "log_warn"):
-        shared.event_log.log_warn(msg)
-        return
-    if hasattr(shared, "log_warn"):
-        shared.log_warn(msg)  # type: ignore[attr-defined]
+    """Log a warning event via SharedState (thread-safe)."""
+    try:
+        shared.log_warn(msg)
+    except Exception:
+        try:
+            from core import LogLevel
+            shared.event_log.add(LogLevel.WARN, msg)
+        except Exception:
+            return
 
 
 def _get_event_rows_text(shared: SharedState) -> str:
-    with shared.lock:
-        # EventLog stores rows in a private list to enforce ring-buffer semantics.
-        rows = list(getattr(shared.event_log, "rows", []))
+    """Return formatted event-log text for the Event window."""
+    try:
+        with shared.lock:
+            rows = shared.event_log.rows_snapshot()
+    except Exception:
+        rows = []
 
     out: List[str] = []
     for r in rows:
-        # Timestamp formatting: use core formatter when available, else local fallback.
-        try:
-            ts = r.ts_str()  # preferred (core_v005+)
-        except Exception:
-            ts = fmt_ts_et(getattr(r, "ts", time.time()))
-
+        ts = fmt_ts_et(getattr(r, "ts", now_ts()))
         lvl_obj = getattr(r, "level", "INFO")
         lvl = getattr(lvl_obj, "value", str(lvl_obj))
         msg = getattr(r, "text", "")
         out.append(f"• {ts} {lvl} {msg}")
     return "\n".join(out)
-
-
-def _decorate_desc(path: str, desc: str) -> str:
-    """
-    Append units and a concrete example to each config row description.
-
-    Notes:
-    - Percent inputs are entered as human percent values (e.g., 0.25 means 0.25%).
-    - Internal storage for percent fields remains fractional (e.g., 0.0025).
-    - The returned string is single-line to keep the GUI compact.
-    """
-    p = path.lower()
-    NO_UNITS_SUFFIX = {
-        'straddle.enable_bull',
-        'straddle.enable_bear',
-        'straddle.enable_neutral',
-        'straddle.gate_arming_auto',
-        'ui.allow_confirm_anytime_when_armable',
-        'ui.popup_on_armable',
-        'ui.sound_on_armable',
-    }
-    if path in NO_UNITS_SUFFIX:
-        return desc
-    extra_parts = []
-
-    if "time_et" in p:
-        extra_parts.append("units: HH:MM ET (e.g., 09:44)")
-    elif p.endswith("_s") or "timeout" in p or "hold_s" in p or "hang" in p or "tick_s" in p:
-        extra_parts.append("units: seconds (e.g., 0.25 = 250ms)")
-    elif "pct" in p or "percent" in p:
-        extra_parts.append("units: percent (e.g., 0.25 = 0.25%)")
-    elif "points" in p or "width" in p:
-        extra_parts.append("units: index points (e.g., 50 = 50 points)")
-    elif "ticks" in p or "tick_size" in p:
-        extra_parts.append("units: ticks (e.g., 1 = one minimum tick)")
-    elif "mult" in p and ("pct" not in p and "percent" not in p):
-        extra_parts.append("units: multiplier (e.g., 2.5 = 2.5x = 250%)")
-    elif "budget" in p or "credit" in p or "balance" in p or "funds" in p:
-        extra_parts.append("units: USD (e.g., 2000 = $2,000)")
-
-    if not extra_parts:
-        # Provide at least one hint even when the key name is nonstandard.
-        return f"{desc} [units: see key name; example: 1]"
-    return f"{desc} [{' | '.join(extra_parts)}]"
 
 
 # =============================================================================
@@ -543,6 +506,14 @@ class MainWindow(QMainWindow):
         _log_info(self._shared, "GUI: Worker threads started")
         self._refresh_all()
         _log_info(self._shared, "GUI: Ready")
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Request worker shutdown/flatten when the GUI window is closed."""
+        try:
+            self._tm.request_stop()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     # -------------------------------------------------------------------------
     # Real Time tab
@@ -1103,23 +1074,23 @@ class MainWindow(QMainWindow):
     def _on_straddle_open(self) -> None:
         with self._shared.lock:
             self._shared.gui.straddle_open_pressed = True
-        _log_info(self._shared, "• GUI: STRADDLE OPEN pressed.")
+        _log_info(self._shared, "GUI: STRADDLE OPEN pressed.")
 
     def _on_straddle_confirm(self) -> None:
         with self._shared.lock:
             self._shared.gui.manual_confirm_pressed = True
-        _log_info(self._shared, "• GUI: STRADDLE CONFIRM pressed.")
+        _log_info(self._shared, "GUI: STRADDLE CONFIRM pressed.")
 
     def _on_pcs_open(self) -> None:
         with self._shared.lock:
             self._shared.gui.pcs_open_pressed = True
-        _log_info(self._shared, "• GUI: PCS OPEN pressed.")
+        _log_info(self._shared, "GUI: PCS OPEN pressed.")
 
     def _on_shutdown(self) -> None:
         with self._shared.lock:
             self._shared.gui.shutdown_pressed = True
         self._shared.shutdown_event.set()
-        _log_warn(self._shared, "• GUI: Shutdown/Flatten pressed.")
+        _log_warn(self._shared, "GUI: Shutdown/Flatten pressed.")
 
     def _confirm(self, title: str, text: str) -> bool:
         r = QMessageBox.question(self, title, text, QMessageBox.Yes | QMessageBox.No)
@@ -1130,21 +1101,21 @@ class MainWindow(QMainWindow):
             return
         with self._shared.lock:
             self._shared.gui.clear_lock_straddle_timed = True
-        _log_info(self._shared, "• GUI: Clear STRADDLE TIMED lock requested.")
+        _log_info(self._shared, "GUI: Clear STRADDLE TIMED lock requested.")
 
     def _on_clear_straddle_gated(self) -> None:
         if not self._confirm("Confirm", "Clear STRADDLE GATED day lock?"):
             return
         with self._shared.lock:
             self._shared.gui.clear_lock_straddle_gated = True
-        _log_info(self._shared, "• GUI: Clear STRADDLE GATED lock requested.")
+        _log_info(self._shared, "GUI: Clear STRADDLE GATED lock requested.")
 
     def _on_clear_pcs(self) -> None:
         if not self._confirm("Confirm", "Clear PCS once/day lock?"):
             return
         with self._shared.lock:
             self._shared.gui.clear_lock_pcs = True
-        _log_info(self._shared, "• GUI: Clear PCS lock requested.")
+        _log_info(self._shared, "GUI: Clear PCS lock requested.")
 
     # -------------------------------------------------------------------------
     # Save config (disk write only on press)
@@ -1159,7 +1130,7 @@ class MainWindow(QMainWindow):
                 save_config(cfg, CONFIG_PATH)  # type: ignore[misc]
             else:
                 save_config(cfg)  # type: ignore[misc]
-            _log_info(self._shared, "• Config saved to disk.")
+            _log_info(self._shared, "Config saved to disk.")
         except Exception as e:
             _log_warn(self._shared, f"• Config save failed: {e!r}")
 
@@ -1496,14 +1467,6 @@ def _call_load_config() -> Any:
     if len(sig.parameters) >= 1:
         return load_config(CONFIG_PATH)  # type: ignore[misc]
     return load_config()  # type: ignore[misc]
-
-def closeEvent(self, event: QCloseEvent) -> None:
-    """Ensure a clean shutdown signal when the GUI is closed."""
-    try:
-        self._tm.request_stop()
-    except Exception:
-        pass
-    super().closeEvent(event)
 
 
 def run_gui(shared: SharedState) -> int:

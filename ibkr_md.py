@@ -127,6 +127,16 @@ class MarketDataProvider:
         """Return latest SPY last price, or None if unavailable."""
         raise NotImplementedError
 
+
+
+    def poll_bars_1m_since_open(self) -> Tuple[Bar1m, ...]:
+        """Return SPY 1-minute bars since today's RTH open, or empty if unavailable."""
+        raise NotImplementedError
+
+    def poll_bars_5m_since_open(self) -> Tuple[Bar1m, ...]:
+        """Return SPY 5-minute bars since today's RTH open, or empty if unavailable."""
+        raise NotImplementedError
+
     def poll_option_quotes(self) -> Dict[OptionKey, OptionQuote]:
         """Return latest option quotes for requested keys (may be partial)."""
         raise NotImplementedError
@@ -192,7 +202,7 @@ class IBInsyncMarketDataProvider(MarketDataProvider):
         with shared.lock:
             mode = shared.config.account.mode
         port = 7497 if mode == AccountMode.PAPER else 7496
-        client_id = random.randint(1000, 9999)
+        client_id = 101  # fixed clientId
 
         # ib.connect() raises if it cannot connect.
         self._ib.connect(self._connected_host, port, clientId=client_id, readonly=True, timeout=2.0)
@@ -315,7 +325,52 @@ class IBInsyncMarketDataProvider(MarketDataProvider):
         self._bars_last_refresh_ts = now
         return self._bars_cache
 
-    def poll_option_quotes(self) -> Dict[OptionKey, OptionQuote]:
+    
+    def poll_bars_5m_since_open(self) -> Tuple[Bar1m, ...]:
+        """Return SPY 5-minute bars since today's RTH open (useRTH=True)."""
+        if self._ib is None or self._spy_contract is None or not self.is_connected():
+            return tuple()
+        try:
+            bars = self._ib.reqHistoricalData(
+                self._spy_contract,
+                endDateTime="",
+                durationStr="1 D",
+                barSizeSetting="5 mins",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+                keepUpToDate=False,
+            )
+        except Exception:
+            return tuple()
+
+        out: List[Bar1m] = []
+        try:
+            for b in bars:
+                dt = getattr(b, "date", None)
+                if isinstance(dt, (int, float)):
+                    ts = float(dt)
+                else:
+                    try:
+                        ts = float(dt.timestamp()) if dt is not None else 0.0
+                    except Exception:
+                        ts = 0.0
+                close = float(getattr(b, "close", 0.0))
+                out.append(
+                    Bar1m(
+                        ts=ts,
+                        open=float(getattr(b, "open", close)),
+                        high=float(getattr(b, "high", close)),
+                        low=float(getattr(b, "low", close)),
+                        close=close,
+                        vwap=None,  # day-truth vwap comes from 1-minute series in the hub
+                    )
+                )
+        except Exception:
+            return tuple()
+        return tuple(out)
+
+def poll_option_quotes(self) -> Dict[OptionKey, OptionQuote]:
         if self._ib is None or not self.is_connected():
             return {}
 
@@ -383,6 +438,12 @@ class StubMarketDataProvider(MarketDataProvider):
 
     def update_requested_options(self, keys: Set[OptionKey]) -> None:
         self._requested = set(keys)
+
+    def poll_bars_1m_since_open(self) -> Tuple[Bar1m, ...]:
+        return tuple()
+
+    def poll_bars_5m_since_open(self) -> Tuple[Bar1m, ...]:
+        return tuple()
 
     def poll_underlying_spy_last(self) -> Optional[float]:
         if not self._connected:
@@ -485,6 +546,12 @@ class NullMarketDataProvider(MarketDataProvider):
     def update_requested_options(self, keys: Set[OptionKey]) -> None:
         self._requested = set(keys)
 
+    def poll_bars_1m_since_open(self) -> Tuple[Bar1m, ...]:
+        return tuple()
+
+    def poll_bars_5m_since_open(self) -> Tuple[Bar1m, ...]:
+        return tuple()
+
     def poll_underlying_spy_last(self) -> Optional[float]:
         return None
 
@@ -528,6 +595,9 @@ class MarketDataHub(threading.Thread):
         self._connected: bool = False
         self._last_conn_state: bool = False
         self._last_conn_error: str = ""
+        self._next_connect_attempt_ts: float = 0.0
+        self._connect_backoff_s: float = 5.0
+        self._connect_failed_episode: bool = False
         self._no_acct_id_episode: bool = False
         with self._shared.lock:
             setattr(self._shared, "ibkr_connected", False)
@@ -535,6 +605,12 @@ class MarketDataHub(threading.Thread):
 
         # Bar tracking
         self._bars: List[Bar1m] = []
+        self._bars_5m: List[Bar1m] = []
+        self._spy_rsi_5m: Optional[float] = None
+        self._spy_sma_5m: Optional[float] = None
+        self._bars_1m_missing_episode: bool = False
+        self._bars_5m_missing_episode: bool = False
+        self._quotes_missing_episode: bool = False
         self._builder: Optional[_StubBarBuilder] = None
         self._hod: Optional[float] = None
         self._lod: Optional[float] = None
@@ -645,16 +721,60 @@ class MarketDataHub(threading.Thread):
             should_connect = self._should_connect(cfg, run_mode, acct_mode, acct_id)
             self._apply_connectivity(should_connect)
 
+            
+            bars_1m = self._provider.poll_bars_1m_since_open()
+            if bars_1m:
+                if getattr(self, "_bars_1m_missing_episode", False):
+                    self._shared.log_info("MD: SPY 1m bars restored")
+                self._bars_1m_missing_episode = False
+                self._bars = list(bars_1m)
+                highs = [b.high for b in self._bars]
+                lows = [b.low for b in self._bars]
+                self._hod = max(highs) if highs else self._hod
+                self._lod = min(lows) if lows else self._lod
+                if self._bars[-1].vwap is not None:
+                    self._vwap_running = float(self._bars[-1].vwap)
+            else:
+                if self._provider.is_connected() and not getattr(self, "_bars_1m_missing_episode", False):
+                    self._shared.log_warn("MD: SPY 1m bars unavailable")
+                    self._bars_1m_missing_episode = True
+
+            bars_5m = self._provider.poll_bars_5m_since_open()
+            if bars_5m:
+                if getattr(self, "_bars_5m_missing_episode", False):
+                    self._shared.log_info("MD: SPY 5m bars restored")
+                self._bars_5m_missing_episode = False
+                self._bars_5m = list(bars_5m)
+                closes_5m = [b.close for b in self._bars_5m]
+                self._spy_rsi_5m = _calc_rsi_wilder(closes_5m, int(cfg.pcs.rsi_length))
+                self._spy_sma_5m = _calc_sma(closes_5m, int(cfg.pcs.sma_length))
+            else:
+                if self._provider.is_connected() and not getattr(self, "_bars_5m_missing_episode", False):
+                    self._shared.log_warn("MD: SPY 5m bars unavailable")
+                    self._bars_5m_missing_episode = True
+
             spy_last = self._provider.poll_underlying_spy_last()
-            if spy_last is not None:
+            if spy_last is None and self._bars:
+                spy_last = self._bars[-1].close
+
+            # Offline stub builder (never fabricate bars for IBKR mode).
+            if spy_last is not None and isinstance(self._provider, StubMarketDataProvider) and not bars_1m:
                 self._update_bars_and_levels(spy_last)
+
 
             req_keys = self._collect_requested_option_keys()
             self._provider.update_requested_options(req_keys)
 
             quotes = self._provider.poll_option_quotes()
             if quotes:
+                if self._quotes_missing_episode:
+                    self._shared.log_info("MD: SPX options subscription; quotes restored")
+                self._quotes_missing_episode = False
                 self._option_quotes.update(quotes)
+            else:
+                if req_keys and self._provider.is_connected() and (not self._quotes_missing_episode):
+                    self._shared.log_warn("MD: SPX options subscription; quotes unavailable")
+                    self._quotes_missing_episode = True
             # Drop quotes for keys no longer requested to keep snapshot concise.
             self._option_quotes = {k: v for k, v in self._option_quotes.items() if k in req_keys}
 
@@ -759,7 +879,10 @@ class MarketDataHub(threading.Thread):
             except Exception as e:
                 with self._shared.lock:
                     self._shared.ibkr_connected = False
-                self._shared.log_warn(f"IBKR: Connect failed: {e!r}")
+                self._connect_failed_episode = True
+                self._next_connect_attempt_ts = now + self._connect_backoff_s
+                self._connect_backoff_s = min(self._connect_backoff_s * 2.0, 60.0)
+                self._shared.log_warn(f"IBKR: Connect failed: {e!r} (retry in {int(self._next_connect_attempt_ts - now)}s)")
                 self._set_conn_state(False, str(e))
 
         elif (not should_connect) and currently:
@@ -876,6 +999,37 @@ class MarketDataHub(threading.Thread):
     def _publish(self, snap: MarketSnapshot) -> None:
         with self._shared.lock:
             self._shared.market = snap
+            # Parallel 5-minute bars + indicators for strategy logic.
+            self._shared.bars_5m = tuple(getattr(self, "_bars_5m", []))
+            self._shared.spy_rsi_5m = getattr(self, "_spy_rsi_5m", None)
+            self._shared.spy_sma_5m = getattr(self, "_spy_sma_5m", None)
             # Convenience heartbeat mirror for GUI/status; snapshot remains source of truth.
             self._shared.md_heartbeat_ts = snap.hub_heartbeat_ts
         # Status lines are handled by other components; hub only publishes data.
+def _calc_sma(closes: List[float], length: int) -> Optional[float]:
+    if length <= 0 or len(closes) < length:
+        return None
+    return sum(closes[-length:]) / float(length)
+
+
+def _calc_rsi_wilder(closes: List[float], length: int) -> Optional[float]:
+    if length <= 0 or len(closes) < (length + 1):
+        return None
+    start = len(closes) - (length + 1)
+    gains = 0.0
+    losses = 0.0
+    for i in range(start + 1, start + 1 + length):
+        d = closes[i] - closes[i - 1]
+        if d >= 0:
+            gains += d
+        else:
+            losses += -d
+    avg_gain = gains / float(length)
+    avg_loss = losses / float(length)
+    if avg_loss <= 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+
