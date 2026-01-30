@@ -1031,7 +1031,7 @@ class StraddleTriggerSupervisor(threading.Thread):
             pass_1m = ge.neutral_pass
 
         with self._shared.lock:
-            bars_5m = list(getattr(self._shared, 'bars_5m', []))
+            bars_5m = list(getattr(snap, 'bars_5m', None) or getattr(self._shared, 'bars_5m', []))
         pass_5m = self._compute_pass_for_bars(
             selected=selected,
             bars=bars_5m,
@@ -1253,23 +1253,33 @@ class PCSTriggerSupervisor(threading.Thread):
     def _signals_pass(self, snap: MarketSnapshot, cfg) -> bool:
         if snap.spy_last is None:
             return False
-        closes = [float(b.close) for b in snap.bars_1m]
-        rsi_val = _rsi(closes, int(cfg.pcs.rsi_length))
-        if rsi_val is None or rsi_val >= float(cfg.pcs.rsi_max):
-            return False
-        sma_val = _sma(closes, int(cfg.pcs.sma_length))
-        if sma_val is None or float(snap.spy_last) <= sma_val:
+        closes_1m = [float(b.close) for b in snap.bars_1m]
+        closes_5m = [float(b.close) for b in getattr(snap, 'bars_5m', [])]
+
+        # RSI/SMA can be evaluated on either 1-minute or 5-minute closes. A PCS signal is considered
+        # satisfied when EITHER timeframe passes the RSI and SMA tests.
+        def _tf_pass(closes: List[float]) -> bool:
+            if len(closes) < max(int(cfg.pcs.rsi_length) + 1, int(cfg.pcs.sma_length) + 1):
+                return False
+            rsi_val = _rsi(closes, int(cfg.pcs.rsi_length))
+            if rsi_val is None or rsi_val >= float(cfg.pcs.rsi_max):
+                return False
+            sma_val = _sma(closes, int(cfg.pcs.sma_length))
+            if sma_val is None:
+                return False
+            return float(snap.spy_last) > sma_val
+
+        if not (_tf_pass(closes_1m) or _tf_pass(closes_5m)):
             return False
 
-        # % change since last close: approximate using first bar close as "prior".
-        # A real implementation would use yesterday close; this is deterministic and
-        # sufficient for consistent trigger behavior with the available snapshot data.
-        if len(closes) < 2:
+        # % change since last close: prefer a prior-close value supplied by MarketDataHub; fall back to the
+        # first 1-minute bar close when prior-close is unavailable (keeps behavior deterministic).
+        if len(closes_1m) < 2:
             return False
-        prior = closes[0]
+        prior = getattr(snap, 'spy_prev_close', None) or getattr(snap, 'spy_yesterday_close', None) or closes_1m[0]
         if prior <= 0:
             return False
-        pct = (float(snap.spy_last) - prior) / prior
+        pct = (float(snap.spy_last) - float(prior)) / float(prior) * 100.0
         return pct >= float(cfg.pcs.pct_change_min)
 
 
