@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+from decimal import Decimal, ROUND_HALF_UP
 from dataclasses import fields, is_dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -53,6 +54,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import (
+    BudgetMode,
     AccountMode,
     DayLockType,
     MarketSnapshot,
@@ -90,6 +92,53 @@ def _vwap_dev(last: Optional[float], vwap: Optional[float]) -> Optional[float]:
     if last is None or vwap is None or vwap == 0:
         return None
     return (last - vwap) / vwap
+
+def _parse_money(txt: str) -> Optional[float]:
+    """Parse a money string like '$2,000.50' into a float."""
+    t = txt.strip().replace("$", "").replace(",", "")
+    if t == "":
+        return None
+    try:
+        return float(t)
+    except Exception:
+        return None
+
+def _float_to_str(x: float) -> str:
+    """Render a float for editing without forcing trailing zeros."""
+    return format(x, ".10g")
+
+
+
+def _money_to_str(x: float) -> str:
+    """Render money with at most 2 decimals and no forced trailing zeros."""
+    d = Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    # Strip trailing zeros while keeping at most 2 decimals.
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
+def _percent_from_fraction_to_str(frac: float) -> str:
+    """Render a fraction (0.0025) as a percent string (0.25)."""
+    pct = frac * 100.0
+    # Rule: show integers >=1% as integer; otherwise show at least 2 decimals.
+    if pct >= 1.0 and abs(pct - round(pct)) < 1e-12:
+        return str(int(round(pct)))
+    # Minimum 2 decimals for <1% or non-integer.
+    return f"{pct:.2f}"
+
+
+def _parse_percent(txt: str) -> Optional[float]:
+    """Parse a percent string like '0.25' or '0.25%' into a float percent value."""
+    t = txt.strip().replace("%", "")
+    if t == "":
+        return None
+    try:
+        return float(t)
+    except Exception:
+        return None
+
 
 
 # =============================================================================
@@ -171,13 +220,13 @@ CONFIG_META: Dict[str, Tuple[str, str]] = {
     "straddle.timed_entry_time_et": ("TIMED entry time (ET, HH:MM).", "Straddle Settings"),
     "straddle.allow_multiple_gated_per_day": ("Allow multiple gated entries per day (else lock).", "Straddle Settings"),
     "straddle.gate_deadline_time_et": ("Gate/entry deadline time (ET, HH:MM).", "Straddle Settings"),
-    "straddle.call_delta_target": ("Call delta target for selection.", "Straddle Settings"),
-    "straddle.put_delta_target": ("Put delta target (absolute) for selection.", "Straddle Settings"),
-    "straddle.delta_tolerance": ("Delta tolerance around target.", "Straddle Settings"),
+    "straddle.call_delta_target": ("Call delta target for selection (range 0.01–1.00).", "Straddle Settings"),
+    "straddle.put_delta_target": ("Put delta target for selection (range 0.01–1.00).", "Straddle Settings"),
+    "straddle.delta_tolerance": ("Delta ± permissible for option selection around the target.", "Straddle Settings"),
     "straddle.budget_pct_available_funds": ("Budget as % of AvailableFunds.", "Straddle Settings"),
     "straddle.leg_cap_pct_each": ("Per-leg cap as % of budget (limit-price based).", "Straddle Settings"),
     "straddle.entry_spread_max_pct_mid": ("Max spread% of mid allowed for entry (each leg).", "Straddle Settings"),
-    "straddle.entry_price_tick_size": ("Tick size used for entry price improvement.", "Straddle Settings"),
+    "straddle.entry_price_tick_size": ("Price increment added to the last limit order when mid is stale (0.05 = $0.05 per contract).", "Straddle Settings"),
     "straddle.entry_price_unchanged_s": ("Seconds mid must remain unchanged before +1 tick.", "Straddle Settings"),
     "straddle.entry_fill_timeout_s": ("Entry timeout seconds before cancel remainder.", "Straddle Settings"),
     "straddle.stop_soft_pct": ("Soft stop P&L percent (bid-based).", "Straddle Settings"),
@@ -190,23 +239,76 @@ CONFIG_META: Dict[str, Tuple[str, str]] = {
     "pcs.once_per_day_lock": ("Enforce PCS once/day hard lock.", "PCS+Tail Settings"),
     "pcs.min_bars_since_open": ("Minimum bars since open required.", "PCS+Tail Settings"),
     "pcs.deadline_time_et": ("PCS deadline time (ET, HH:MM).", "PCS+Tail Settings"),
-    "pcs.rsi_length": ("RSI lookback length.", "PCS+Tail Settings"),
-    "pcs.rsi_max": ("RSI must be below this to allow entry.", "PCS+Tail Settings"),
-    "pcs.sma_length": ("SMA length for bullish filter.", "PCS+Tail Settings"),
-    "pcs.pct_change_min": ("Min % change since last close (0.0025=0.25%).", "PCS+Tail Settings"),
-    "pcs.short_put_delta_target": ("Short put delta target.", "PCS+Tail Settings"),
+    "pcs.rsi_length": ("RSI length (e.g., 14 = 14 periods/minutes).", "PCS+Tail Settings"),
+    "pcs.rsi_max": ("Relative Strength Indicator threshold (e.g., >60 indicates high strength).", "PCS+Tail Settings"),
+    "pcs.sma_length": ("Simple Moving Average length.", "PCS+Tail Settings"),
+    "pcs.pct_change_min": ("Min % change since last close (percent entry; e.g., 1.5 = 1.5%).", "PCS+Tail Settings"),
+    "pcs.short_put_delta_target": ("Target delta for short put in the put credit spread.", "PCS+Tail Settings"),
     "pcs.delta_tolerance": ("Delta tolerance for PCS/tail selection.", "PCS+Tail Settings"),
     "pcs.width_points": ("Spread width in points.", "PCS+Tail Settings"),
-    "pcs.fixed_budget": ("Fixed PCS budget in dollars.", "PCS+Tail Settings"),
-    "pcs.budget_credit_mult": ("Require credit_total * mult <= budget.", "PCS+Tail Settings"),
+    "pcs.fixed_budget": ("PCS fixed budget in USD (e.g., 2000 = $2,000).", "PCS+Tail Settings"),
+    "pcs.budget_credit_mult": ("Budget multiplier constraint: qty * credit * mult <= budget (e.g., if credit=$100 then qty*100*2.5 <= budget).", "PCS+Tail Settings"),
     "pcs.entry_spread_max_pct_mid": ("Max spread% of mid allowed for entry (each leg).", "PCS+Tail Settings"),
-    "pcs.stop_debit_mult": ("Stop when debit_to_close >= mult * credit_received.", "PCS+Tail Settings"),
+    "pcs.stop_debit_mult": ("Stop loss multiplier: stop if debit >= credit * mult (e.g., 2 = 2x = 200% => stop at 2*credit).", "PCS+Tail Settings"),
     "pcs.tail_delta_target": ("Tail delta target.", "PCS+Tail Settings"),
-    "pcs.tail_qty_mult_of_pcs": ("Tail qty multiplier (floor).", "PCS+Tail Settings"),
-    "pcs.tail_activation_profit_mult_of_credit": ("Tail stop activates after this profit multiple.", "PCS+Tail Settings"),
-    "pcs.tail_ratchet_ladder": ("Tail ratchet ladder thresholds/locks (credit multiples).", "PCS+Tail Settings"),
+    "pcs.tail_qty_mult_of_pcs": ("Tail qty multiplier vs PCS qty (e.g., 0.7 = 0.7x = 70%).", "PCS+Tail Settings"),
+    "pcs.tail_activation_profit_mult_of_credit": ("Tail stop activation multiplier: activates when tail profit >= mult*PCS credit; initial stop locks break-even (e.g., credit=$100 => activates at value=$150 and stops at $100).", "PCS+Tail Settings"),
+    "pcs.tail_ratchet_ladder": ("Tail ratchet ladder [ratchet_rate, initial_ratchet]. Example: [1.0,0.5] => at 150% set stop to 50%; at 250% set stop to 150%; continues by +100%.", "PCS+Tail Settings"),
     "pcs.tail_hang_seconds": ("Tail hang seconds once stops active.", "PCS+Tail Settings"),
+    "straddle.budget_mode": ("Straddle budget mode selection (radio buttons above).", "Straddle Settings"),
+    "straddle.budget_pct_available_funds": ("Straddle budget as % of AvailableFunds (percent entry; e.g., 100 = 100%).", "Straddle Settings"),
+    "straddle.fixed_budget_usd": ("Straddle fixed budget in USD (e.g., 2000 = $2,000).", "Straddle Settings"),
+    "pcs.budget_mode": ("PCS budget mode selection (radio buttons above).", "PCS+Tail Settings"),
+    "pcs.budget_pct_available_funds": ("PCS budget as % of AvailableFunds (percent entry; e.g., 25 = 25%).", "PCS+Tail Settings"),
 }
+
+
+
+
+
+
+def _decorate_desc(path: str, desc: str) -> str:
+    """
+    Append units and a concrete example to each config row description.
+
+    Notes:
+    - Percent inputs are entered as human percent values (e.g., 0.25 means 0.25%).
+    - Internal storage for percent fields remains fractional (e.g., 0.0025).
+    - The returned string is single-line to keep the GUI compact.
+    """
+    p = path.lower()
+    NO_UNITS_SUFFIX = {
+        'straddle.enable_bull',
+        'straddle.enable_bear',
+        'straddle.enable_neutral',
+        'straddle.gate_arming_auto',
+        'ui.allow_confirm_anytime_when_armable',
+        'ui.popup_on_armable',
+        'ui.sound_on_armable',
+    }
+    if path in NO_UNITS_SUFFIX:
+        return desc
+    extra_parts = []
+
+    if "time_et" in p:
+        extra_parts.append("units: HH:MM ET (e.g., 09:44)")
+    elif p.endswith("_s") or "timeout" in p or "hold_s" in p or "hang" in p or "tick_s" in p:
+        extra_parts.append("units: seconds (e.g., 0.25 = 250ms)")
+    elif "pct" in p or "percent" in p:
+        extra_parts.append("units: percent (e.g., 0.25 = 0.25%)")
+    elif "points" in p or "width" in p:
+        extra_parts.append("units: index points (e.g., 50 = 50 points)")
+    elif "ticks" in p or "tick_size" in p:
+        extra_parts.append("units: ticks (e.g., 1 = one minimum tick)")
+    elif "mult" in p and ("pct" not in p and "percent" not in p):
+        extra_parts.append("units: multiplier (e.g., 2.5 = 2.5x = 250%)")
+    elif "budget" in p or "credit" in p or "balance" in p or "funds" in p:
+        extra_parts.append("units: USD (e.g., 2000 = $2,000)")
+
+    if not extra_parts:
+        # Provide at least one hint even when the key name is nonstandard.
+        return f"{desc} [units: see key name; example: 1]"
+    return f"{desc} [{' | '.join(extra_parts)}]"
 
 
 # =============================================================================
@@ -416,6 +518,61 @@ class MainWindow(QMainWindow):
     # Settings/config tab builder
     # -------------------------------------------------------------------------
 
+
+    def _build_budget_mode_controls(self, strategy: str) -> QWidget:
+        """
+        Build the budget mode radio-button controls for a strategy.
+
+        Option B behavior: both budget input fields remain editable at all times; the radio choice
+        selects which field is applied by the execution/strategy sizing logic.
+        """
+        w = QWidget()
+        layout = QHBoxLayout(w)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        lbl = QLabel("Budget mode:")
+        lbl.setToolTip("Select which budget input is applied. Both inputs remain editable.")
+        layout.addWidget(lbl)
+
+        rb_pct = QRadioButton("% Available Funds")
+        rb_fix = QRadioButton("Fixed USD")
+        rb_pct.setToolTip("Use the % of AvailableFunds budget input.")
+        rb_fix.setToolTip("Use the fixed USD budget input.")
+        layout.addWidget(rb_pct)
+        layout.addWidget(rb_fix)
+        layout.addStretch(1)
+
+        path_mode = f"{strategy}.budget_mode"
+        
+        with self._shared.lock:
+            mode = getattr(cfg, strategy)   # strategy is "straddle" or "pcs"
+            current = mode.budget_mode
+
+        # Default fallback
+        if not isinstance(current, BudgetMode):
+            current = BudgetMode.PCT_AVAILABLE_FUNDS if strategy == "straddle" else BudgetMode.FIXED_USD
+
+        rb_pct.setChecked(current == BudgetMode.PCT_AVAILABLE_FUNDS)
+        rb_fix.setChecked(current == BudgetMode.FIXED_USD)
+
+        def set_mode(mode: BudgetMode) -> None:
+            self._apply_config_value(path_mode, mode)
+
+        def on_pct_toggled(checked: bool) -> None:
+            if checked:
+                set_mode(BudgetMode.PCT_AVAILABLE_FUNDS)
+
+        def on_fix_toggled(checked: bool) -> None:
+            if checked:
+                set_mode(BudgetMode.FIXED_USD)
+
+        rb_pct.toggled.connect(on_pct_toggled)
+        rb_fix.toggled.connect(on_fix_toggled)
+
+        return w
+
+
     def _build_config_tab(self, tab_name: str) -> QWidget:
         w = QWidget()
         root = QVBoxLayout(w)
@@ -438,10 +595,12 @@ class MainWindow(QMainWindow):
             if tab_for_key != tab_name:
                 continue
 
+            desc = _decorate_desc(path, desc)
+
             label = QLabel(path)
             label.setToolTip(desc)
 
-            editor, getter = self._make_editor_for_value(flat[path])
+            editor, getter = self._make_editor_for_value(path, flat[path])
             editor.setToolTip(desc)
 
             row = QWidget()
@@ -481,7 +640,7 @@ class MainWindow(QMainWindow):
         elif isinstance(editor, QLineEdit):
             editor.editingFinished.connect(lambda: self._apply_config_value(path, getter()))  # type: ignore[attr-defined]
 
-    def _make_editor_for_value(self, value: Any) -> Tuple[QWidget, Callable[[], Any]]:
+    def _make_editor_for_value(self, path: str, value: Any) -> Tuple[QWidget, Callable[[], Any]]:
         """
         Create a compact editor for a config leaf value.
 
@@ -533,21 +692,55 @@ class MainWindow(QMainWindow):
                 return int(sp.value())
 
             return sp, getter
-
         if isinstance(value, float):
-            dsp = QDoubleSpinBox()
-            dsp.setRange(-1e9, 1e9)
-            dsp.setDecimals(6)
-            dsp.setSingleStep(0.01)
-            dsp.setValue(float(value))
-            dsp.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            dsp.setMaximumWidth(160)
+            p = path.lower()
+            is_percent = ('pct' in p) or ('percent' in p)
+            is_money = any(k in p for k in ['budget', 'usd', 'balance', 'funds', 'credit'])
+
+            if is_percent:
+                le = QLineEdit(_percent_from_fraction_to_str(float(value)))
+                le.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                le.setMaximumWidth(140)
+
+                def getter() -> Any:
+                    pct = _parse_percent(le.text())
+                    if pct is None:
+                        return float(value)
+                    return float(pct) / 100.0
+
+                return le, getter
+
+            if is_money:
+                le = QLineEdit(_money_to_str(float(value)))
+                le.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                le.setMaximumWidth(160)
+
+                def getter() -> Any:
+                    m = _parse_money(le.text())
+                    if m is None:
+                        return float(value)
+                    d = Decimal(str(m)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    return float(d)
+
+                return le, getter
+
+            # Default float editor: compact, no forced trailing zeros.
+            le = QLineEdit(_float_to_str(float(value)))
+            le.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            le.setMaximumWidth(180)
 
             def getter() -> Any:
-                return float(dsp.value())
+                txt = le.text().strip()
+                try:
+                    return float(txt)
+                except Exception:
+                    return float(value)
 
-            return dsp, getter
+            return le, getter
 
+
+
+        # Default editor for strings, collections, and any other leaf values.
         le = QLineEdit(str(value))
         le.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         le.setMaximumWidth(280)

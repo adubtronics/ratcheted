@@ -59,6 +59,13 @@ class AccountMode(str, Enum):
     LIVE = "LIVE"
 
 
+
+class BudgetMode(str, Enum):
+    """Budget sizing mode for strategy position sizing."""
+    PCT_AVAILABLE_FUNDS = "PCT_AVAILABLE_FUNDS"
+    FIXED_USD = "FIXED_USD"
+
+
 class RunMode(str, Enum):
     """
     Execution mode:
@@ -578,7 +585,7 @@ class ExportConfig:
 @dataclass
 class DebugConfig:
     """Debug/simulation/replay settings."""
-    run_mode: RunMode = RunMode.REAL.value
+    run_mode: RunMode = RunMode.REAL
     replay_file: str = ""
     replay_step_mode: bool = False  # if True, advance only by GUI step button
     sim_fill_assume_complete: bool = True  # if quote exists and qty requested, fill immediately
@@ -602,7 +609,10 @@ class StraddleConfig:
     put_delta_target: float = 0.50
     delta_tolerance: float = 0.05
 
+    budget_mode: BudgetMode = BudgetMode.PCT_AVAILABLE_FUNDS
+    # Budget inputs (both editable in GUI; budget_mode selects which is applied).
     budget_pct_available_funds: float = 1.00
+    fixed_budget_usd: float = 0.0
     leg_cap_pct_each: float = 0.50
 
     entry_spread_max_pct_mid: float = 0.0002  # 0.02%
@@ -664,7 +674,10 @@ class PCSConfig:
     width_points: float = 50.0
 
     # Budget/sizing
+    budget_mode: BudgetMode = BudgetMode.FIXED_USD
+    # Budget inputs (both editable in GUI; budget_mode selects which is applied).
     fixed_budget: float = 2000.0
+    budget_pct_available_funds: float = 0.0
     budget_credit_mult: float = 2.5  # 2.5 * credit_total <= budget
 
     # Spread filter
@@ -709,8 +722,14 @@ class RuntimeConfig:
         Strict-but-tolerant loader:
         - Unknown keys are ignored.
         - Missing keys use defaults.
+        - Accepts legacy enum string forms like 'AccountMode.PAPER'.
         """
         cfg = RuntimeConfig()
+
+        def _normalize_enum_str(v: Any) -> Any:
+            if isinstance(v, str) and "." in v:
+                return v.split(".")[-1]
+            return v
 
         def apply(obj: Any, src: Dict[str, Any]) -> None:
             for k, v in src.items():
@@ -719,17 +738,21 @@ class RuntimeConfig:
                 cur = getattr(obj, k)
                 if dataclass_is_instance(cur) and isinstance(v, dict):
                     apply(cur, v)
+                    continue
+
+                if isinstance(cur, Enum):
+                    vv = _normalize_enum_str(v)
+                    setattr(obj, k, type(cur)(vv))
                 else:
-                    # Enum coercion
-                    if isinstance(cur, Enum):
-                        setattr(obj, k, type(cur)(v))
-                    else:
-                        setattr(obj, k, v)
+                    setattr(obj, k, v)
 
         apply(cfg, d)
-        # Enums nested
-        cfg.account.mode = AccountMode(str(cfg.account.mode))
-        cfg.debug.run_mode = RunMode(str(cfg.debug.run_mode))
+
+        # Normalize nested enums after assignment as well (tolerant of legacy strings).
+        cfg.account.mode = AccountMode(_normalize_enum_str(cfg.account.mode))
+        cfg.debug.run_mode = RunMode(_normalize_enum_str(cfg.debug.run_mode))
+        cfg.straddle.budget_mode = BudgetMode(_normalize_enum_str(cfg.straddle.budget_mode))
+        cfg.pcs.budget_mode = BudgetMode(_normalize_enum_str(cfg.pcs.budget_mode))
         return cfg
 
 

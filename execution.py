@@ -45,6 +45,7 @@ from core import (
     TradeState,
     TransitionGuard,
     now_ts,
+    BudgetMode,
 )
 
 
@@ -92,6 +93,36 @@ class ExecutionEngine:
     # -------------------------------------------------------------------------
     # SECTION: Main loop entrypoint
     # -------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------
+    # SECTION: Budgeting helpers (strategy-specific sizing modes)
+    # -------------------------------------------------------------------------
+
+    def _budget_usd_for_strategy(self, strategy: StrategyId, available_funds: float) -> float:
+        """
+        Resolve the active budget in USD for the given strategy based on RuntimeConfig.
+
+        Notes:
+        - GUI edits keep both budget fields editable; the budget_mode selects which is applied.
+        - Percent inputs are entered as human percents in the GUI, but stored as fractions in config.
+          (e.g., 0.25% is stored as 0.0025). Therefore, percent-of-funds budgets use the stored
+          fractional form directly.
+        """
+        cfg = self._shared.config
+
+        if strategy == StrategyId.STRADDLE:
+            if cfg.straddle.budget_mode == BudgetMode.PCT_AVAILABLE_FUNDS:
+                pct = float(cfg.straddle.budget_pct_available_funds)
+                return max(0.0, pct * float(available_funds))
+            return max(0.0, float(cfg.straddle.fixed_budget_usd))
+
+        if strategy == StrategyId.PCS_TAIL:
+            if cfg.pcs.budget_mode == BudgetMode.PCT_AVAILABLE_FUNDS:
+                pct = float(cfg.pcs.budget_pct_available_funds)
+                return max(0.0, pct * float(available_funds))
+            return max(0.0, float(cfg.pcs.fixed_budget))
+
+        return 0.0
 
     def run_loop(self) -> None:
         """
@@ -163,6 +194,25 @@ class ExecutionEngine:
 
         if run_mode == RunMode.REAL and not connected:
             self._shared.event_log.log_warn("• REAL entry blocked: IBKR not connected.")
+            return
+
+
+        with self._shared.lock:
+            available_funds = float(self._shared.available_funds)
+
+        # Enforce budget guard at consumption time (protects against stale upstream sizing).
+        budget_usd = self._budget_usd_for_strategy(intent.strategy, available_funds)
+        if budget_usd <= 0.0:
+            self._shared.event_log.log_warn(
+                f"• Entry blocked: budget is 0 for {intent.strategy.value}."
+            )
+            return
+
+        if float(intent.max_cost) > budget_usd:
+            self._shared.event_log.log_warn(
+                f"• Entry blocked: intent cost ${float(intent.max_cost):.2f} exceeds budget ${budget_usd:.2f} "
+                f"for {intent.strategy.value}."
+            )
             return
 
         trade_id = str(uuid.uuid4())[:8]
