@@ -484,6 +484,13 @@ class StatusTextView(QTextEdit):
         self.setReadOnly(True)
         self.setLineWrapMode(QTextEdit.WidgetWidth)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    
+    def set_text_preserve_scroll(self, text: str) -> None:
+        """Update text while preserving the user's vertical scroll position."""
+        sb = self.verticalScrollBar()
+        prior = sb.value()
+        self.setPlainText(text)
+        sb.setValue(min(prior, sb.maximum()))
 
 
 # =============================================================================
@@ -698,9 +705,62 @@ class MainWindow(QMainWindow):
         return w
 
 
+
+    def _build_stub_md_toggle(self) -> QWidget:
+        """Build the Debug-only toggle for synthetic/stub market data.
+
+        This toggle controls whether MarketDataHub is allowed to connect a stub provider that
+        generates synthetic (moving) SPY/option quotes when no IBKR/TWS session is available.
+
+        Notes:
+        - This is intentionally separate from 'simulated_execution' (orders). SIM execution can run
+          with LIVE market data; stub market data is only for running the UI/logic without IBKR.
+        - If the underlying config schema does not define debug.stub_market_data, this UI still
+          works for the current session via setattr/getattr, but it will not persist across restart
+          until core.py adds the field to the config dataclass and serializer.
+        """
+        w = QWidget()
+        hb = QHBoxLayout(w)
+        hb.setContentsMargins(0, 0, 0, 0)
+
+        chk = QCheckBox("Stub Market Data")
+        desc = QLabel(
+            "Enable a fake market data provider that generates synthetic (moving) prices/quotes "
+            "when IBKR/TWS is not connected. Use only for UI/testing."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #666;")
+        desc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        with self._shared.lock:
+            dbg = getattr(self._shared.config, "debug", None)
+            current = bool(getattr(dbg, "stub_market_data", False)) if dbg is not None else False
+
+        chk.setChecked(current)
+
+        def on_toggled(state: int) -> None:
+            enabled = bool(state == Qt.Checked)
+            with self._shared.lock:
+                dbg2 = getattr(self._shared.config, "debug", None)
+                if dbg2 is None:
+                    return
+                # Use setattr so this works even if the schema doesn't yet include the field.
+                setattr(dbg2, "stub_market_data", enabled)
+
+        chk.stateChanged.connect(on_toggled)  # type: ignore[attr-defined]
+
+        hb.addWidget(chk, 0)
+        hb.addWidget(desc, 1)
+        return w
+
     def _build_config_tab(self, tab_name: str) -> QWidget:
         w = QWidget()
         root = QVBoxLayout(w)
+
+        # Debug-only: stub/synthetic market data toggle.
+        if tab_name == self.TAB_DEBUG:
+            root.addWidget(self._build_stub_md_toggle())
+
 
         # Budget mode selection (Option B): both fields remain editable; radio selects which mode is applied.
         if tab_name == self.TAB_STRADDLE:
@@ -1220,7 +1280,7 @@ class MainWindow(QMainWindow):
         self._ledger.setPlainText("\n".join(str(x) for x in ledger[-30:]))
 
     def _refresh_text_panels(self) -> None:
-        self._events.set_text_preserve_scroll(_build_status_report(self._shared))
+        self._status.set_text_preserve_scroll(_build_status_report(self._shared))
 
         cur_conn = _infer_connected(self._shared)
         if self._last_connected is None:
