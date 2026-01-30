@@ -1220,7 +1220,7 @@ class MainWindow(QMainWindow):
         self._ledger.setPlainText("\n".join(str(x) for x in ledger[-30:]))
 
     def _refresh_text_panels(self) -> None:
-        self._status.set_text_preserve_scroll(_build_status_report(self._shared))
+        self._events.set_text_preserve_scroll(_build_status_report(self._shared))
 
         cur_conn = _infer_connected(self._shared)
         if self._last_connected is None:
@@ -1372,9 +1372,9 @@ def _build_status_report(shared: "SharedState") -> str:
 
     # Connection intent hint (does not guarantee connectivity; explains gating).
     with shared.lock:
-        acct_mode = getattr(shared.cfg.account, "mode", "PAPER")
-        acct_id_p = (getattr(shared.cfg.account, "paper_account_id", "") or "").strip()
-        acct_id_l = (getattr(shared.cfg.account, "live_account_id", "") or "").strip()
+        acct_mode = getattr(shared.config.account, "mode", "PAPER")
+        acct_id_p = (getattr(shared.config.account, "paper_account_id", "") or "").strip()
+        acct_id_l = (getattr(shared.config.account, "live_account_id", "") or "").strip()
     selected_id = acct_id_p if str(acct_mode) == "PAPER" else acct_id_l
     if not selected_id:
         lines.append("  IBKR Connect: BLOCKED (missing account id for selected mode)")
