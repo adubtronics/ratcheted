@@ -512,6 +512,12 @@ class EventLog:
         with self._lock:
             return list(self._rows)
 
+    @property
+    def rows(self) -> List[EventRow]:
+        """Return a snapshot list of event rows for GUI display."""
+        return self.rows_snapshot()
+
+
     def add(self, level: LogLevel, text: str) -> None:
         with self._lock:
             self._rows.append(EventRow(ts=now_ts(), level=level, text=text))
@@ -891,6 +897,11 @@ class SharedState:
     status_lines: List[str] = field(default_factory=list)
 
     # Event log ring buffer
+    md_heartbeat_ts: float = 0.0
+    planner_heartbeat_ts: float = 0.0
+    straddle_supervisor_heartbeat_ts: float = 0.0
+    pcs_supervisor_heartbeat_ts: float = 0.0
+    execution_heartbeat_ts: float = 0.0
     event_log: EventLog = field(default_factory=lambda: EventLog(capacity=3000))
 
     # GUI flags

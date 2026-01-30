@@ -56,6 +56,24 @@ from core import (
     now_ts,
 )
 
+# =============================================================================
+# SECTION: Shutdown helpers
+# =============================================================================
+
+def _should_stop(shared: "SharedState") -> bool:
+    """Return True when any shutdown signal is active."""
+    try:
+        with shared.lock:
+            if getattr(shared.gui, "shutdown_pressed", False):
+                return True
+    except Exception:
+        pass
+    ev = getattr(shared, "shutdown_event", None)
+    if isinstance(ev, threading.Event) and ev.is_set():
+        return True
+    return False
+
+
 
 # =============================================================================
 # SECTION: Time helpers (ET)
@@ -175,7 +193,7 @@ class PlannerBase(threading.Thread):
                 self._tick_id += 1
                 self._tick()
             except Exception as e:
-                self._shared.log_error(f"• {self.name} error: {e!r}")
+                self._shared.log_error(f"{self.name} error: {e!r}")
             tick_s = self._get_tick_s()
             elapsed = time.monotonic() - t0
             remaining = max(0.0, tick_s - elapsed)
@@ -616,13 +634,18 @@ class StraddleTriggerSupervisor(threading.Thread):
         self._tick_id = 0
 
     def run(self) -> None:
-        while not self._shared.shutdown_event.is_set():
+        while True:
+            # Heartbeat for GUI diagnostics
+            with self._shared.lock:
+                setattr(self._shared, "straddle_supervisor_heartbeat_ts", time.time())
+            if _should_stop(self._shared):
+                return
             t0 = time.monotonic()
             try:
                 self._tick_id += 1
                 self._scan_once(self._tick_id)
             except Exception as e:
-                self._shared.log_error(f"• StraddleTriggerSupervisor error: {e!r}")
+                self._shared.log_error(f"StraddleTriggerSupervisor error: {e!r}")
             tick_s = self._get_tick_s()
             elapsed = time.monotonic() - t0
             remaining = max(0.0, tick_s - elapsed)
@@ -671,11 +694,11 @@ class StraddleTriggerSupervisor(threading.Thread):
             if gui_flags.clear_lock_straddle_timed:
                 self._shared.day_locks[DayLockType.STRADDLE_TIMED.value] = False
                 gui_flags.clear_lock_straddle_timed = False
-                self._shared.log_info("• Cleared STRADDLE TIMED day lock.")
+                self._shared.log_info("Cleared STRADDLE TIMED day lock.")
             if gui_flags.clear_lock_straddle_gated:
                 self._shared.day_locks[DayLockType.STRADDLE_GATED.value] = False
                 gui_flags.clear_lock_straddle_gated = False
-                self._shared.log_info("• Cleared STRADDLE GATED day lock.")
+                self._shared.log_info("Cleared STRADDLE GATED day lock.")
 
     def _active_straddle_trade_by_channel(self, trades) -> Dict[str, bool]:
         out = {TriggerChannel.OPEN.value: False, TriggerChannel.TIMED.value: False, TriggerChannel.GATED.value: False}
@@ -723,17 +746,17 @@ class StraddleTriggerSupervisor(threading.Thread):
         with self._shared.lock:
             self._shared.gui.straddle_open_pressed = False
         if active_by_channel.get(TriggerChannel.OPEN.value, False):
-            self._shared.log_warn("• STRADDLE OPEN ignored: existing OPEN-channel trade active.")
+            self._shared.log_warn("STRADDLE OPEN ignored: existing OPEN-channel trade active.")
             return True
         # OPEN bypasses gates but still obeys prerequisites (spread/budget, deadline).
         if not self._common_entry_prereqs_ok(cfg, gui, ibkr_connected):
-            self._shared.log_warn("• STRADDLE OPEN blocked: go/account/connect prerequisites not satisfied.")
+            self._shared.log_warn("STRADDLE OPEN blocked: go/account/connect prerequisites not satisfied.")
             return True
         if not _is_before_deadline(cfg.straddle.gate_deadline_time_et):
-            self._shared.log_warn("• STRADDLE OPEN blocked: deadline exceeded.")
+            self._shared.log_warn("STRADDLE OPEN blocked: deadline exceeded.")
             return True
         if plan.call is None or plan.put is None:
-            self._shared.log_warn("• STRADDLE OPEN blocked: planner has no contracts.")
+            self._shared.log_warn("STRADDLE OPEN blocked: planner has no contracts.")
             return True
 
         keys = (plan.call, plan.put)
@@ -747,7 +770,7 @@ class StraddleTriggerSupervisor(threading.Thread):
             return True
         qtys, budget = _compute_straddle_qtys(snap, cfg, available_funds, plan.call, plan.put)
         if qtys[0] <= 0 or qtys[1] <= 0:
-            self._shared.log_warn("• STRADDLE OPEN blocked: budget/leg-cap produced zero qty.")
+            self._shared.log_warn("STRADDLE OPEN blocked: budget/leg-cap produced zero qty.")
             return True
 
         deadline_ts = _parse_hhmm_et_to_ts_today(cfg.straddle.gate_deadline_time_et)
@@ -762,7 +785,7 @@ class StraddleTriggerSupervisor(threading.Thread):
             deadline_ts=float(deadline_ts),
         )
         self._q.put(intent)
-        self._shared.log_info("• STRADDLE EntryIntent created (OPEN channel).")
+        self._shared.log_info("STRADDLE EntryIntent created (OPEN channel).")
         return True
 
     def _try_timed_channel(
@@ -820,10 +843,10 @@ class StraddleTriggerSupervisor(threading.Thread):
             deadline_ts=float(_parse_hhmm_et_to_ts_today(cfg.straddle.gate_deadline_time_et)),
         )
         self._q.put(intent)
-        self._shared.log_info("• STRADDLE EntryIntent created (TIMED channel).")
+        self._shared.log_info("STRADDLE EntryIntent created (TIMED channel).")
         with self._shared.lock:
             self._shared.day_locks[DayLockType.STRADDLE_TIMED.value] = True
-        self._shared.log_info("• STRADDLE TIMED day lock set.")
+        self._shared.log_info("STRADDLE TIMED day lock set.")
         return True
 
     def _try_gated_channel(
@@ -892,12 +915,12 @@ class StraddleTriggerSupervisor(threading.Thread):
             deadline_ts=float(_parse_hhmm_et_to_ts_today(cfg.straddle.gate_deadline_time_et)),
         )
         self._q.put(intent)
-        self._shared.log_info(f"• STRADDLE EntryIntent created (GATED channel, {selected_gate.value}).")
+        self._shared.log_info(f"STRADDLE EntryIntent created (GATED channel, {selected_gate.value}).")
 
         with self._shared.lock:
             if not bool(cfg.straddle.allow_multiple_gated_per_day):
                 self._shared.day_locks[DayLockType.STRADDLE_GATED.value] = True
-                self._shared.log_info("• STRADDLE GATED day lock set.")
+                self._shared.log_info("STRADDLE GATED day lock set.")
             # Reset gate state after intent emission.
             gr = self._shared.gate_by_channel[TriggerChannel.GATED.value]
             gr.state = GateState.DISARMED
@@ -919,7 +942,7 @@ class StraddleTriggerSupervisor(threading.Thread):
                 gr.armable = False
                 gr.armed = False
                 gr.last_transition_ts = now_ts()
-                self._shared.log_info(f"• Gate state -> BLOCKED ({reason}).")
+                self._shared.log_info(f"Gate state -> BLOCKED ({reason}).")
 
     def _update_gate_runtime(self, tick_id: int, cfg, snap: MarketSnapshot, gui, locks: Dict[str, bool], gate_rt: GateRuntime) -> None:
         ge = evaluate_straddle_gate(snap, cfg)
@@ -985,17 +1008,27 @@ class StraddleTriggerSupervisor(threading.Thread):
                     gr.armed = False
 
             # Logging (infrequent events only)
+            if prev_state != gr.state:
+                self._shared.log_info(f"Gate state -> {gr.state.value}.")
+            if prev_armable != gr.armable:
+                if gr.armable:
+                    self._shared.log_info(f"Gate became ARMABLE ({gr.selected_gate.value}).")
+                else:
+                    self._shared.log_info("Gate no longer ARMABLE.")
+            if prev_armed != gr.armed and gr.armed:
+                self._shared.log_info("Gate ARMED.")
+
             if prev_sel != gr.selected_gate:
-                self._shared.log_info(f"• Gate selected: {gr.selected_gate.value}.")
+                self._shared.log_info(f"Gate selected: {gr.selected_gate.value}.")
             if prev_armable != gr.armable and gr.armable:
-                self._shared.log_info(f"• Gate -> ARMABLE ({gr.selected_gate.value}).")
+                self._shared.log_info(f"Gate -> ARMABLE ({gr.selected_gate.value}).")
                 if not bool(cfg.straddle.gate_arming_auto):
                     if bool(cfg.ui.popup_on_armable):
-                        self._shared.log_info("• Gate ARMABLE: manual confirmation required.")
+                        self._shared.log_info("Gate ARMABLE: manual confirmation required.")
             if prev_armed != gr.armed and gr.armed:
-                self._shared.log_info("• Gate -> ARMED.")
+                self._shared.log_info("Gate -> ARMED.")
             if prev_state != gr.state:
-                self._shared.log_info(f"• Gate state transition: {prev_state.value} -> {gr.state.value}.")
+                self._shared.log_info(f"Gate state transition: {prev_state.value} -> {gr.state.value}.")
 
 
 # =============================================================================
@@ -1013,13 +1046,18 @@ class PCSTriggerSupervisor(threading.Thread):
         self._tick_id = 0
 
     def run(self) -> None:
-        while not self._shared.shutdown_event.is_set():
+        while True:
+            # Heartbeat for GUI diagnostics
+            with self._shared.lock:
+                setattr(self._shared, "pcs_supervisor_heartbeat_ts", time.time())
+            if _should_stop(self._shared):
+                return
             t0 = time.monotonic()
             try:
                 self._tick_id += 1
                 self._scan_once(self._tick_id)
             except Exception as e:
-                self._shared.log_error(f"• PCSTriggerSupervisor error: {e!r}")
+                self._shared.log_error(f"PCSTriggerSupervisor error: {e!r}")
             with self._shared.lock:
                 tick_s = float(self._shared.config.threads.triggers_tick_s)
             elapsed = time.monotonic() - t0
@@ -1042,7 +1080,7 @@ class PCSTriggerSupervisor(threading.Thread):
             if self._shared.gui.clear_lock_pcs:
                 self._shared.day_locks[DayLockType.PCS.value] = False
                 self._shared.gui.clear_lock_pcs = False
-                self._shared.log_info("• Cleared PCS day lock.")
+                self._shared.log_info("Cleared PCS day lock.")
 
         if snap is None or plan is None:
             return
@@ -1123,11 +1161,11 @@ class PCSTriggerSupervisor(threading.Thread):
             deadline_ts=float(_parse_hhmm_et_to_ts_today(cfg.pcs.deadline_time_et)),
         )
         self._q.put(intent)
-        self._shared.log_info("• PCS+TAIL EntryIntent created.")
+        self._shared.log_info("PCS+TAIL EntryIntent created.")
         with self._shared.lock:
             if bool(cfg.pcs.once_per_day_lock):
                 self._shared.day_locks[DayLockType.PCS.value] = True
-                self._shared.log_info("• PCS day lock set.")
+                self._shared.log_info("PCS day lock set.")
 
     def _active_pcs_trade(self, trades) -> bool:
         for tr in trades:

@@ -22,11 +22,14 @@ Python: 3.10.4
 from __future__ import annotations
 
 import time
+import threading
+import queue
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from core import (
+    BudgetMode,
     EntryIntent,
     ExitIntent,
     FlattenIntent,
@@ -45,7 +48,6 @@ from core import (
     TradeState,
     TransitionGuard,
     now_ts,
-    BudgetMode,
 )
 
 
@@ -85,10 +87,28 @@ class ExecutionEngine:
     - go flag blocks new entries only, never exits.
     """
 
-    def __init__(self, shared: SharedState) -> None:
+    def __init__(self, shared: SharedState, intent_queue: "queue.Queue[Intent]" | None = None) -> None:
+        """Create an execution engine.
+
+        Parameters
+        ----------
+        shared:
+            Shared state container.
+        intent_queue:
+            Optional intent queue (single-consumer). If not provided, the engine will
+            fall back to `shared.intent_queue` when present, otherwise it will create
+            a private queue.
+        """
         self._shared = shared
         self._working_orders: Dict[str, WorkingOrder] = {}
         self._tick_id: int = 0
+        self._flattening: bool = False
+
+        self._shutdown_event: threading.Event = getattr(shared, "shutdown_event", threading.Event())
+        if intent_queue is not None:
+            self._intent_queue: "queue.Queue[Intent]" = intent_queue
+        else:
+            self._intent_queue = getattr(shared, "intent_queue", queue.Queue(maxsize=1000))
 
     # -------------------------------------------------------------------------
     # SECTION: Main loop entrypoint
@@ -124,20 +144,32 @@ class ExecutionEngine:
 
         return 0.0
 
-    def run_loop(self) -> None:
+    def run(self) -> None:
         """
         Main execution loop.
 
         This is intended to run in its own daemon thread.
         Tick pacing is controlled by config.execution_tick_s.
         """
-        while not self._shared.shutdown_event.is_set():
+        self._shared.event_log.log_info("Execution: Starting")
+        while not self._shutdown_event.is_set():
             tick_start = time.monotonic()
             self._tick_id += 1
+
+            # Heartbeat for GUI diagnostics
+            try:
+                with self._shared.lock:
+                    setattr(self._shared, "execution_heartbeat_ts", time.time())
+            except Exception:
+                pass
 
             # Shutdown/flatten priority
             if self._is_shutdown_pressed():
                 self._flatten_all()
+                try:
+                    self._shutdown_event.set()
+                except Exception:
+                    pass
                 break
 
             # Consume at most one intent per tick to preserve determinism.
@@ -153,6 +185,7 @@ class ExecutionEngine:
             if remaining > 0:
                 time.sleep(min(remaining, 0.05))
 
+        self._shared.event_log.log_info("Execution: Stopped")
         # Final safety flatten
         self._flatten_all()
 
@@ -162,7 +195,7 @@ class ExecutionEngine:
 
     def _consume_one_intent(self) -> None:
         try:
-            intent: Intent = self._shared.intent_queue.get_nowait()
+            intent: Intent = self._intent_queue.get_nowait()
         except Exception:
             return
 
@@ -468,6 +501,10 @@ class ExecutionEngine:
     # -------------------------------------------------------------------------
 
     def _flatten_all(self) -> None:
+        if self._flattening:
+            return
+        self._flattening = True
+        self._shared.event_log.log_warn("Flatten: Start")
         """
         Flatten all open trades immediately.
 
@@ -479,6 +516,9 @@ class ExecutionEngine:
                 if leg.state == LegState.OPEN:
                     self._exit_leg(trade, leg, reason="SHUTDOWN FLATTEN")
         self._shared.event_log.log_warn("• Shutdown flatten complete.")
+
+        self._shared.event_log.log_warn("Flatten: Done")
+        self._flattening = False
 
     def _is_shutdown_pressed(self) -> bool:
         with self._shared.lock:

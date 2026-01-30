@@ -42,6 +42,24 @@ from core import (
     now_ts,
 )
 
+# =============================================================================
+# SECTION: Shutdown helpers
+# =============================================================================
+
+def _should_stop(shared: "SharedState") -> bool:
+    """Return True when any shutdown signal is active."""
+    try:
+        with shared.lock:
+            if getattr(shared.gui, "shutdown_pressed", False):
+                return True
+    except Exception:
+        pass
+    ev = getattr(shared, "shutdown_event", None)
+    if isinstance(ev, threading.Event) and ev.is_set():
+        return True
+    return False
+
+
 
 # =============================================================================
 # SECTION: Optional IBKR adapter import
@@ -242,6 +260,13 @@ class MarketDataHub(threading.Thread):
         super().__init__(daemon=True, name="MarketDataHub")
         self._shared = shared
         self._provider: MarketDataProvider = provider if provider is not None else StubMarketDataProvider()
+        self._connected: bool = False
+        self._last_conn_state: bool = False
+        self._last_conn_error: str = ""
+        self._no_acct_id_episode: bool = False
+        with self._shared.lock:
+            setattr(self._shared, "ibkr_connected", False)
+            setattr(self._shared, "ibkr_last_error", "")
 
         # Bar tracking
         self._bars: List[Bar1m] = []
@@ -266,7 +291,6 @@ class MarketDataHub(threading.Thread):
     # -------------------------------------------------------------------------
     # SECTION: Main loop
     # -------------------------------------------------------------------------
-
     def run(self) -> None:
         """
         Publisher loop:
@@ -274,9 +298,27 @@ class MarketDataHub(threading.Thread):
         - Poll provider quickly; never block long.
         - Publish MarketSnapshot every tick.
         """
-        while not self._shared.shutdown_event.is_set():
+        self._shared.event_log.log_info("MD: Starting")
+        while True:
+            # Heartbeat for GUI diagnostics (updated every tick).
+            with self._shared.lock:
+                self._shared.md_heartbeat_ts = time.time()
+            if _should_stop(self._shared):
+                self._shared.event_log.log_info("MD: Stopped")
+                return
             tick_start = time.monotonic()
             cfg, run_mode, acct_mode, acct_id, tick_s = self._snapshot_config()
+
+            # Connect/disconnect decision logging (rate-limited per episode).
+            require_id = bool(getattr(cfg.account, "require_account_id_to_connect", True))
+            if require_id and (acct_id or "").strip() == "":
+                if not self._no_acct_id_episode:
+                    self._no_acct_id_episode = True
+                    self._shared.event_log.log_warn(
+                        f"IBKR: Not connecting (account id missing) mode={acct_mode} run_mode={run_mode}"
+                    )
+            else:
+                self._no_acct_id_episode = False
 
             # Connect/disconnect rules:
             should_connect = self._should_connect(cfg, run_mode, acct_mode, acct_id)
@@ -334,6 +376,16 @@ class MarketDataHub(threading.Thread):
             tick_s = float(cfg.threads.md_hub_tick_s)
         return cfg, run_mode, acct_mode, acct_id, tick_s
 
+    def _set_conn_state(self, connected: bool, error: str = "") -> None:
+        """Persist connectivity state into SharedState (for GUI display)."""
+        if connected == self._last_conn_state and error == self._last_conn_error:
+            return
+        self._last_conn_state = connected
+        self._last_conn_error = error
+        with self._shared.lock:
+            setattr(self._shared, "ibkr_connected", connected)
+            setattr(self._shared, "ibkr_last_error", error)
+
     def _should_connect(self, cfg, run_mode: RunMode, acct_mode: AccountMode, acct_id: str) -> bool:
         # REPLAY mode never connects.
         if run_mode == RunMode.REPLAY:
@@ -343,8 +395,34 @@ class MarketDataHub(threading.Thread):
         return True
 
     def _apply_connectivity(self, should_connect: bool) -> None:
+        """
+        Apply desired connectivity state.
+
+        This is called on every hub tick. It emits infrequent lifecycle events:
+        - "IBKR: Connecting" once per connect attempt
+        - "IBKR: Connected" on success
+        - "IBKR: Connect failed" on failure (once per failure episode)
+        - "IBKR: Disconnected" when disconnecting due to config/mode change
+        """
         currently = self._provider.is_connected()
+
         if should_connect and not currently:
+            # Connect attempt (log once per attempt).
+            try:
+                with self._shared.lock:
+                    acct_mode = self._shared.config.account.mode
+                    acct_id = (
+                        self._shared.config.account.paper_account_id
+                        if acct_mode == AccountMode.PAPER
+                        else self._shared.config.account.live_account_id
+                    )
+                self._shared.event_log.log_info(
+                    f"IBKR: Connecting (mode={acct_mode.value}, account_id={'set' if (acct_id or '').strip() else 'missing'})"
+                )
+            except Exception:
+                # If config cannot be read, still attempt connect; provider will handle errors.
+                self._shared.event_log.log_info("IBKR: Connecting")
+
             try:
                 self._provider.connect(self._shared)
                 with self._shared.lock:
@@ -355,19 +433,23 @@ class MarketDataHub(threading.Thread):
                         if self._shared.config.account.mode == AccountMode.PAPER
                         else self._shared.config.account.live_account_id
                     )
-                self._shared.event_log.log_info("• Market data provider connected.")
+                self._shared.event_log.log_info("IBKR: Connected")
+                self._set_conn_state(True, "")
             except Exception as e:
                 with self._shared.lock:
                     self._shared.ibkr_connected = False
-                self._shared.event_log.log_warn(f"• Market data provider connect failed: {e!r}")
-        elif not should_connect and currently:
+                self._shared.event_log.log_warn(f"IBKR: Connect failed: {e!r}")
+                self._set_conn_state(False, str(e))
+
+        elif (not should_connect) and currently:
             try:
                 self._provider.disconnect()
             except Exception:
                 pass
             with self._shared.lock:
                 self._shared.ibkr_connected = False
-            self._shared.event_log.log_info("• Market data provider disconnected (account id missing or replay mode).")
+            self._shared.event_log.log_info("IBKR: Disconnected (account id missing or mode changed)")
+
 
     # -------------------------------------------------------------------------
     # SECTION: Requested contract collection (plans + active trades)
@@ -473,4 +555,6 @@ class MarketDataHub(threading.Thread):
     def _publish(self, snap: MarketSnapshot) -> None:
         with self._shared.lock:
             self._shared.market = snap
+            # Convenience heartbeat mirror for GUI/status; snapshot remains source of truth.
+            self._shared.md_heartbeat_ts = snap.hub_heartbeat_ts
         # Status lines are handled by other components; hub only publishes data.

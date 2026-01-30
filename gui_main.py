@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import ast
 import inspect
+import time
+import threading
+import queue
+from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from dataclasses import fields, is_dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
-import time
-from datetime import datetime
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
@@ -54,6 +56,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtGui import QCloseEvent
 
 from core import (
     BudgetMode,
@@ -62,16 +65,200 @@ from core import (
     MarketSnapshot,
     RunMode,
     SharedState,
+    EntryIntent,
     load_config,
     now_ts,
     save_config,
+    fmt_ts_et,
 )
+from ibkr_md import MarketDataHub
+from strategies import StraddleTriggerSupervisor, PCSTriggerSupervisor
+from execution import ExecutionEngine
 
 # =============================================================================
 # SECTION: Config path
 # =============================================================================
 
 CONFIG_PATH = "config/runtime_config.json"
+
+
+# =============================================================================
+# SECTION: Thread manager (owns worker thread lifecycle)
+# =============================================================================
+
+class _ThreadManager:
+    """Owns and manages worker threads started by the GUI."""
+
+    def __init__(self, shared: SharedState) -> None:
+        self._shared = shared
+        self._shutdown = shared.shutdown_event
+        self._threads: List[threading.Thread] = []
+        self._md: Optional[MarketDataHub] = None
+        self._straddle_sup: Optional[StraddleTriggerSupervisor] = None
+        self._pcs_sup: Optional[PCSTriggerSupervisor] = None
+        self._exec: Optional[ExecutionEngine] = None
+
+    @property
+    def shutdown_event(self) -> threading.Event:
+        return self._shutdown
+
+    def start_all(self) -> None:
+        """Start MarketDataHub, supervisors, and execution engine."""
+        if self._threads:
+            return
+
+        _log_info(self._shared, "Threads: Starting")
+
+        intents: "queue.Queue[EntryIntent]" = queue.Queue(maxsize=1000)
+
+        # Market data hub publishes snapshots into shared state.
+        self._md = MarketDataHub(self._shared)
+
+        # Supervisors consume snapshots/plans and emit EntryIntent into intents.
+        self._straddle_sup = StraddleTriggerSupervisor(self._shared, intents)
+        self._pcs_sup = PCSTriggerSupervisor(self._shared, intents)
+
+        # Execution engine consumes intents and manages trades.
+        self._exec = ExecutionEngine(self._shared, intents)
+
+        # Start threads (daemon false so they join cleanly).
+        self._threads = [
+            threading.Thread(target=self._md.run, name="MarketDataHub", daemon=True),
+            threading.Thread(target=self._straddle_sup.run, name="StraddleSupervisor", daemon=True),
+            threading.Thread(target=self._pcs_sup.run, name="PCSSupervisor", daemon=True),
+            threading.Thread(target=self._exec.run, name="ExecutionEngine", daemon=True),
+        ]
+        for t in self._threads:
+            t.start()
+
+        _log_info(self._shared, "Threads: Started")
+
+    def request_stop(self) -> None:
+        """Signal threads to stop; execution should flatten immediately."""
+        _log_warn(self._shared, "Threads: Stop requested")
+        self._shutdown.set()
+        try:
+            with self._shared.lock:
+                self._shared.gui.shutdown_pressed = True
+        except Exception:
+            pass
+
+    def is_running(self) -> bool:
+        return any(t.is_alive() for t in self._threads)
+
+
+# =============================================================================
+# SECTION: Config metadata (descriptions + tab routing)
+# =============================================================================
+# Maps fully-qualified config paths to (description, tab-name).
+# Any path not present here will be routed to Debug and show a "(Description missing...)" marker.
+CONFIG_META: Dict[str, Tuple[str, str]] = {
+    "account.eod_export_dir": ('Directory for EOD exports (JSONL/CSV). Example: ./exports', 'Account Balance'),
+    "account.eod_export_enabled": ('Enable end-of-day export once per day.', 'Account Balance'),
+    "account.eod_export_time_et": ('EOD export time in ET. Example: 16:10', 'Account Balance'),
+    "account.live_account_id": ('IBKR Live account id (required to connect in LIVE). Example: U1234567.', 'Account Balance'),
+    "account.mode": ('Trading mode selection: PAPER or LIVE.', 'Account Balance'),
+    "account.paper_account_id": ('IBKR Paper account id (required to connect in PAPER). Example: DU1234567.', 'Account Balance'),
+    "account.starting_balance": ('Starting balance used for analytics if NetLiq unavailable. Example: 25000.', 'Account Balance'),
+    "debug.replay_enabled": ('Enable historical replay mode (loads snapshots from file).', 'Debug'),
+    "debug.replay_path": ('Path to replay snapshot file.', 'Debug'),
+    "debug.simulated_execution": ('SIM execution: no IBKR orders placed; fills assumed if quotes exist.', 'Debug'),
+    "pcs.budget_credit_mult": ('Budget multiplier constraint: qty * credit * mult <= budget (e.g., if credit=$100 then qty*100*2.5 <= budget).', 'PCS+Tail Settings'),
+    "pcs.budget_mode": ('Budget mode applied for new PCS entries (radio-controlled).', 'PCS+Tail Settings'),
+    "pcs.budget_pct_available_funds": ('PCS budget as % of AvailableFunds used when Budget Mode = % funds. Example: 10 = 10%.', 'PCS+Tail Settings'),
+    "pcs.deadline_time_et": ('PCS deadline (ET); after this no new PCS entries. Example: 13:30', 'PCS+Tail Settings'),
+    "pcs.delta_tolerance": ('Delta ± permissible for option selection around targets.', 'PCS+Tail Settings'),
+    "pcs.entry_spread_max_pct_mid": ('PCS spread filter per leg: max spread % of mid. Example: 0.50 = 0.50%.', 'PCS+Tail Settings'),
+    "pcs.fixed_budget": ('PCS fixed USD budget used when Budget Mode = Fixed. Example: 2000.', 'PCS+Tail Settings'),
+    "pcs.min_bars_since_open": ('Minimum 1-min bars since open before PCS can arm/enter. Example: 29.', 'PCS+Tail Settings'),
+    "pcs.once_per_day_lock": ('Once/day lock for PCS entries (clearable via GUI with confirmation).', 'PCS+Tail Settings'),
+    "pcs.pct_change_min": ('Min % change since last close (percent entry; e.g., 1.5 = 1.5%).', 'PCS+Tail Settings'),
+    "pcs.rsi_length": ('RSI length (e.g., 14 = 14 periods/minutes).', 'PCS+Tail Settings'),
+    "pcs.rsi_max": ('Relative Strength Indicator threshold (e.g., >60 indicates high strength).', 'PCS+Tail Settings'),
+    "pcs.short_put_delta_target": ('Target delta for short put in the put credit spread. Example: 0.15.', 'PCS+Tail Settings'),
+    "pcs.sma_length": ('Simple Moving Average length.', 'PCS+Tail Settings'),
+    "pcs.stop_debit_mult": ('Stop loss multiplier: stop if debit >= credit * mult (e.g., 2 = 2x = 200% => stop at 2*credit).', 'PCS+Tail Settings'),
+    "pcs.tail_activation_profit_mult_of_credit": ('Tail stop activation multiplier: activates when tail profit >= mult*PCS credit; initial stop locks break-even (e.g., credit=$100 => activates at value=$150 and stops at $100).', 'PCS+Tail Settings'),
+    "pcs.tail_delta_target": ('Tail put delta target. Example: 0.05.', 'PCS+Tail Settings'),
+    "pcs.tail_delta_tolerance": ('Delta ± permissible for tail option selection.', 'PCS+Tail Settings'),
+    "pcs.tail_hang_seconds": ('Tail hang seconds after stops active (exit if no new high for duration).', 'PCS+Tail Settings'),
+    "pcs.tail_qty_mult_of_pcs": ('Tail qty multiplier vs PCS qty (e.g., 0.7 = 0.7x = 70%).', 'PCS+Tail Settings'),
+    "pcs.tail_ratchet_ladder": ('Tail ratchet ladder [ratchet_rate, initial_ratchet]. Example: [1.0,0.5] => at 150% set stop to 50%; at 250% set stop to 150%; continues by +100%.', 'PCS+Tail Settings'),
+    "pcs.width_points": ('PCS width in SPX points. Example: 50.', 'PCS+Tail Settings'),
+    "straddle.allow_multiple_gated_per_day": ('Allow more than one GATED entry per day (otherwise day-lock after first).', 'Straddle Settings'),
+    "straddle.budget_mode": ('Budget mode applied for new straddle entries (radio-controlled).', 'Straddle Settings'),
+    "straddle.budget_pct_available_funds": ('Straddle budget as % of AvailableFunds used for sizing. Example: 100 = 100%.', 'Straddle Settings'),
+    "straddle.call_delta_target": ('Call delta target for selection (range 0.01–1.00). Example: 0.50 ≈ ATM.', 'Straddle Settings'),
+    "straddle.delta_tolerance": ('Delta ± permissible for option selection around the target. Example: target 0.50 tol 0.05 → [0.45,0.55].', 'Straddle Settings'),
+    "straddle.enable_bear": ('Enable Bear gate evaluation and gated entry channel.', 'Straddle Settings'),
+    "straddle.enable_bull": ('Enable Bull gate evaluation and gated entry channel.', 'Straddle Settings'),
+    "straddle.enable_neutral": ('Enable Neutral gate evaluation and gated entry channel.', 'Straddle Settings'),
+    "straddle.entry_price_stale_s": ('Seconds mid must be unchanged before improving price by tick.', 'Straddle Settings'),
+    "straddle.entry_price_tick_size": ('Price increment added to the last limit order when mid is stale (0.05 = $0.05 per contract).', 'Straddle Settings'),
+    "straddle.entry_spread_max_pct_mid": ('Entry spread filter per leg: max spread % of mid. Example: 0.02 = 0.02%.', 'Straddle Settings'),
+    "straddle.entry_timeout_s": ('Entry order timeout; cancels remaining and proceeds to management.', 'Straddle Settings'),
+    "straddle.fixed_budget_usd": ('Straddle fixed USD budget used when Budget Mode = Fixed. Example: 5000.', 'Straddle Settings'),
+    "straddle.gate_arming_auto": ('Auto-arm when ARMABLE; otherwise manual Confirm required.', 'Straddle Settings'),
+    "straddle.gate_deadline_time_et": ('Gate deadline (ET); after this, no new gated/timed entries. Example: 13:30', 'Straddle Settings'),
+    "straddle.hang_seconds": ('Hang seconds (exit if no new high for this duration while hang active).', 'Straddle Settings'),
+    "straddle.leg_cap_pct_each": ('Max share of budget per leg (call/put). Example: 50 = 50%.', 'Straddle Settings'),
+    "straddle.put_delta_target": ('Put delta target for selection (range 0.01–1.00). Example: 0.50 ≈ ATM.', 'Straddle Settings'),
+    "straddle.ratchet_ladder": ('Ratchet ladder thresholds/locks (percent profits). Example: [(15,0),(30,20)].', 'Straddle Settings'),
+    "straddle.stop_hard_pct": ('Hard stop % (bid-based) immediate exit.', 'Straddle Settings'),
+    "straddle.stop_soft_hold_s": ('Soft stop persistence time before exit.', 'Straddle Settings'),
+    "straddle.stop_soft_pct": ('Soft stop % (bid-based). Requires persistence for soft_stop_hold_s unless hard stop hit.', 'Straddle Settings'),
+    "straddle.timed_entry_enabled": ('Enable Timed channel entry.', 'Straddle Settings'),
+    "straddle.timed_entry_time_et": ('Timed entry trigger time (ET). Example: 09:44', 'Straddle Settings'),
+    "ui.allow_confirm_anytime_when_armable": ('Allow Confirm button any time ARMABLE is true.', 'Straddle Settings'),
+    "ui.exec_tick_s": ('Execution loop tick interval.', 'Debug'),
+    "ui.gui_tick_s": ('GUI refresh interval.', 'Debug'),
+    "ui.md_tick_s": ('Market data hub publish interval.', 'Debug'),
+    "ui.popup_on_armable": ('Popup when gate becomes ARMABLE in Manual arming mode.', 'Straddle Settings'),
+    "ui.sound_on_armable": ('Sound when gate becomes ARMABLE in Manual arming mode.', 'Straddle Settings'),
+    "ui.strategy_tick_s": ('Planner/supervisor scan interval.', 'Debug'),
+}
+
+def _decorate_desc(path: str, desc: str) -> str:
+    """
+    Append units/examples to a config description, unless the key is explicitly exempt.
+
+    Percent inputs are entered as human percent values (e.g., 0.25 means 0.25%).
+    """
+    NO_UNITS_SUFFIX = {
+        "straddle.enable_bull",
+        "straddle.enable_bear",
+        "straddle.enable_neutral",
+        "straddle.gate_arming_auto",
+        "ui.allow_confirm_anytime_when_armable",
+        "ui.popup_on_armable",
+        "ui.sound_on_armable",
+        "straddle.budget_mode",
+        "pcs.budget_mode",
+    }
+    if path in NO_UNITS_SUFFIX:
+        return desc
+
+    p = path.lower()
+    extra: List[str] = []
+
+    if "time_et" in p:
+        extra.append("units: HH:MM ET (e.g., 09:44)")
+    elif p.endswith("_s") or "timeout" in p or "hold_s" in p or "hang" in p or "tick_s" in p:
+        extra.append("units: seconds (e.g., 0.25 = 250ms)")
+    elif "pct" in p or "percent" in p:
+        extra.append("units: percent (e.g., 1.5 = 1.5%)")
+    elif "mult" in p and ("pct" not in p and "percent" not in p):
+        extra.append("units: multiplier (e.g., 2.5 = 2.5x = 250%)")
+    elif "points" in p or "width" in p:
+        extra.append("units: index points (e.g., 50 = 50 points)")
+    elif "ticks" in p or "tick_size" in p:
+        extra.append("units: ticks (e.g., 1 = one minimum tick)")
+    elif "budget" in p or "credit" in p or "balance" in p or "funds" in p:
+        extra.append("units: USD (e.g., 2000 = $2,000)")
+
+    if not extra:
+        return f"{desc} [example: 1]"
+    return f"{desc} [{' | '.join(extra)}]"
 
 # =============================================================================
 # SECTION: Formatting utilities
@@ -165,108 +352,23 @@ def _log_warn(shared: SharedState, msg: str) -> None:
 
 
 def _get_event_rows_text(shared: SharedState) -> str:
-    if hasattr(shared, "event_log") and hasattr(shared.event_log, "rows"):
-        rows = list(shared.event_log.rows)  # type: ignore[attr-defined]
-        return "\n".join([getattr(r, "text", str(r)) for r in rows])
-    return ""
+    with shared.lock:
+        # EventLog stores rows in a private list to enforce ring-buffer semantics.
+        rows = list(getattr(shared.event_log, "rows", []))
 
+    out: List[str] = []
+    for r in rows:
+        # Timestamp formatting: use core formatter when available, else local fallback.
+        try:
+            ts = r.ts_str()  # preferred (core_v005+)
+        except Exception:
+            ts = fmt_ts_et(getattr(r, "ts", time.time()))
 
-# =============================================================================
-# SECTION: Config metadata (description + tab routing)
-# =============================================================================
-
-# Every displayed config row includes a one-line description.
-# Unknown keys fall back to a default description to satisfy the requirement.
-CONFIG_META: Dict[str, Tuple[str, str]] = {
-    # (description, tab_name)
-
-    # Threads (Debug)
-    "threads.md_hub_tick_s": ("MarketDataHub publish tick (seconds).", "Debug"),
-    "threads.planners_tick_s": ("Planner tick rate (seconds).", "Debug"),
-    "threads.triggers_tick_s": ("Trigger supervisor scan tick (seconds).", "Debug"),
-    "threads.execution_tick_s": ("ExecutionEngine management tick (seconds).", "Debug"),
-    "threads.gui_refresh_tick_s": ("GUI refresh timer interval (seconds).", "Debug"),
-
-    # Account (Account Balance)
-    "account.mode": ("Select PAPER vs LIVE.", "Account Balance"),
-    "account.paper_account_id": ("IBKR paper account id; required to connect in PAPER.", "Account Balance"),
-    "account.live_account_id": ("IBKR live account id; required to connect in LIVE.", "Account Balance"),
-    "account.starting_balance_override": ("Starting balance used until NetLiq read (0 disables).", "Account Balance"),
-    "account.require_account_id_to_connect": ("Prevent connect unless selected mode id is set.", "Account Balance"),
-
-    # UI (Straddle/Debug)
-    "ui.allow_confirm_anytime_when_armable": ("Allow Confirm button anytime while armable is true.", "Straddle Settings"),
-    "ui.popup_on_armable": ("Show popup when gate becomes ARMABLE (manual mode).", "Straddle Settings"),
-    "ui.sound_on_armable": ("Play sound when gate becomes ARMABLE (manual mode).", "Straddle Settings"),
-    "ui.event_log_capacity": ("Max number of event rows retained in ring buffer.", "Debug"),
-
-    # Export (Account Balance)
-    "export.export_dir": ("Directory for EOD exports.", "Account Balance"),
-    "export.export_jsonl": ("Enable JSONL export at EOD.", "Account Balance"),
-    "export.export_csv": ("Enable CSV export at EOD.", "Account Balance"),
-    "export.export_once_per_day": ("Write EOD files once per day only.", "Account Balance"),
-
-    # Debug (Debug)
-    "debug.run_mode": ("REAL places orders; SIM simulates; REPLAY uses snapshot file.", "Debug"),
-    "debug.replay_file": ("Path to replay snapshot series file.", "Debug"),
-    "debug.replay_step_mode": ("If true, advance replay only via GUI step.", "Debug"),
-    "debug.sim_fill_assume_complete": ("SIM fills assumed complete if quotes exist.", "Debug"),
-    "debug.sim_deterministic_slippage_ticks": ("SIM deterministic slippage in ticks.", "Debug"),
-
-    # Straddle (Straddle Settings) - include any additional keys as needed
-    "straddle.enable_bull": ("Enable bull gate evaluation.", "Straddle Settings"),
-    "straddle.enable_bear": ("Enable bear gate evaluation.", "Straddle Settings"),
-    "straddle.enable_neutral": ("Enable neutral gate evaluation.", "Straddle Settings"),
-    "straddle.gate_arming_auto": ("Auto-arm when ARMABLE; otherwise manual confirm required.", "Straddle Settings"),
-    "straddle.timed_entry_enabled": ("Enable TIMED channel.", "Straddle Settings"),
-    "straddle.timed_entry_time_et": ("TIMED entry time (ET, HH:MM).", "Straddle Settings"),
-    "straddle.allow_multiple_gated_per_day": ("Allow multiple gated entries per day (else lock).", "Straddle Settings"),
-    "straddle.gate_deadline_time_et": ("Gate/entry deadline time (ET, HH:MM).", "Straddle Settings"),
-    "straddle.call_delta_target": ("Call delta target for selection (range 0.01–1.00).", "Straddle Settings"),
-    "straddle.put_delta_target": ("Put delta target for selection (range 0.01–1.00).", "Straddle Settings"),
-    "straddle.delta_tolerance": ("Delta ± permissible for option selection around the target.", "Straddle Settings"),
-    "straddle.budget_pct_available_funds": ("Budget as % of AvailableFunds.", "Straddle Settings"),
-    "straddle.leg_cap_pct_each": ("Per-leg cap as % of budget (limit-price based).", "Straddle Settings"),
-    "straddle.entry_spread_max_pct_mid": ("Max spread% of mid allowed for entry (each leg).", "Straddle Settings"),
-    "straddle.entry_price_tick_size": ("Price increment added to the last limit order when mid is stale (0.05 = $0.05 per contract).", "Straddle Settings"),
-    "straddle.entry_price_unchanged_s": ("Seconds mid must remain unchanged before +1 tick.", "Straddle Settings"),
-    "straddle.entry_fill_timeout_s": ("Entry timeout seconds before cancel remainder.", "Straddle Settings"),
-    "straddle.stop_soft_pct": ("Soft stop P&L percent (bid-based).", "Straddle Settings"),
-    "straddle.stop_hard_pct": ("Hard stop P&L percent immediate trigger.", "Straddle Settings"),
-    "straddle.stop_soft_hold_s": ("Soft stop must persist this long before exit.", "Straddle Settings"),
-    "straddle.ratchet_ladder": ("Profit thresholds mapped to stop lock levels.", "Straddle Settings"),
-    "straddle.hang_seconds": ("No-new-high hang seconds before hang exit.", "Straddle Settings"),
-
-    # PCS + Tail (PCS+Tail Settings) - include any additional keys as needed
-    "pcs.once_per_day_lock": ("Enforce PCS once/day hard lock.", "PCS+Tail Settings"),
-    "pcs.min_bars_since_open": ("Minimum bars since open required.", "PCS+Tail Settings"),
-    "pcs.deadline_time_et": ("PCS deadline time (ET, HH:MM).", "PCS+Tail Settings"),
-    "pcs.rsi_length": ("RSI length (e.g., 14 = 14 periods/minutes).", "PCS+Tail Settings"),
-    "pcs.rsi_max": ("Relative Strength Indicator threshold (e.g., >60 indicates high strength).", "PCS+Tail Settings"),
-    "pcs.sma_length": ("Simple Moving Average length.", "PCS+Tail Settings"),
-    "pcs.pct_change_min": ("Min % change since last close (percent entry; e.g., 1.5 = 1.5%).", "PCS+Tail Settings"),
-    "pcs.short_put_delta_target": ("Target delta for short put in the put credit spread.", "PCS+Tail Settings"),
-    "pcs.delta_tolerance": ("Delta tolerance for PCS/tail selection.", "PCS+Tail Settings"),
-    "pcs.width_points": ("Spread width in points.", "PCS+Tail Settings"),
-    "pcs.fixed_budget": ("PCS fixed budget in USD (e.g., 2000 = $2,000).", "PCS+Tail Settings"),
-    "pcs.budget_credit_mult": ("Budget multiplier constraint: qty * credit * mult <= budget (e.g., if credit=$100 then qty*100*2.5 <= budget).", "PCS+Tail Settings"),
-    "pcs.entry_spread_max_pct_mid": ("Max spread% of mid allowed for entry (each leg).", "PCS+Tail Settings"),
-    "pcs.stop_debit_mult": ("Stop loss multiplier: stop if debit >= credit * mult (e.g., 2 = 2x = 200% => stop at 2*credit).", "PCS+Tail Settings"),
-    "pcs.tail_delta_target": ("Tail delta target.", "PCS+Tail Settings"),
-    "pcs.tail_qty_mult_of_pcs": ("Tail qty multiplier vs PCS qty (e.g., 0.7 = 0.7x = 70%).", "PCS+Tail Settings"),
-    "pcs.tail_activation_profit_mult_of_credit": ("Tail stop activation multiplier: activates when tail profit >= mult*PCS credit; initial stop locks break-even (e.g., credit=$100 => activates at value=$150 and stops at $100).", "PCS+Tail Settings"),
-    "pcs.tail_ratchet_ladder": ("Tail ratchet ladder [ratchet_rate, initial_ratchet]. Example: [1.0,0.5] => at 150% set stop to 50%; at 250% set stop to 150%; continues by +100%.", "PCS+Tail Settings"),
-    "pcs.tail_hang_seconds": ("Tail hang seconds once stops active.", "PCS+Tail Settings"),
-    "straddle.budget_mode": ("Straddle budget mode selection (radio buttons above).", "Straddle Settings"),
-    "straddle.budget_pct_available_funds": ("Straddle budget as % of AvailableFunds (percent entry; e.g., 100 = 100%).", "Straddle Settings"),
-    "straddle.fixed_budget_usd": ("Straddle fixed budget in USD (e.g., 2000 = $2,000).", "Straddle Settings"),
-    "pcs.budget_mode": ("PCS budget mode selection (radio buttons above).", "PCS+Tail Settings"),
-    "pcs.budget_pct_available_funds": ("PCS budget as % of AvailableFunds (percent entry; e.g., 25 = 25%).", "PCS+Tail Settings"),
-}
-
-
-
-
+        lvl_obj = getattr(r, "level", "INFO")
+        lvl = getattr(lvl_obj, "value", str(lvl_obj))
+        msg = getattr(r, "text", "")
+        out.append(f"• {ts} {lvl} {msg}")
+    return "\n".join(out)
 
 
 def _decorate_desc(path: str, desc: str) -> str:
@@ -354,12 +456,24 @@ class EventTextView(QTextEdit):
         self.setLineWrapMode(QTextEdit.WidgetWidth)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-    def set_text_preserve_autoscroll(self, text: str) -> None:
+
+    def set_text_preserve_scroll(self, text: str) -> None:
+        """Update text while preserving the user's vertical scroll position."""
         sb = self.verticalScrollBar()
-        at_bottom = sb.value() >= (sb.maximum() - 2)
+        prior = sb.value()
+        self.setPlainText(text)
+        sb.setValue(min(prior, sb.maximum()))
+
+    def set_text_preserve_autoscroll(self, text: str) -> None:
+        """Update text while preserving scroll unless user is at bottom (then autoscroll)."""
+        sb = self.verticalScrollBar()
+        prior = sb.value()
+        at_bottom = prior >= (sb.maximum() - 2)
         self.setPlainText(text)
         if at_bottom:
             sb.setValue(sb.maximum())
+        else:
+            sb.setValue(min(prior, sb.maximum()))
 
 
 class StatusTextView(QTextEdit):
@@ -387,9 +501,11 @@ class MainWindow(QMainWindow):
 
     def __init__(self, shared: SharedState) -> None:
         super().__init__()
+        self._tm = _ThreadManager(shared)
         self._boot_logged = False
         self._last_connected: Optional[bool] = None
         self._shared = shared
+        _log_info(self._shared, "GUI: Booting")
         self.setWindowTitle("IBKR Trading Bot GUI")
 
         self._tabs = QTabWidget()
@@ -416,7 +532,10 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._refresh_all)  # type: ignore[attr-defined]
         self._timer.start(int(self._shared.config.threads.gui_refresh_tick_s * 1000))
 
+        self._tm.start_all()
+        _log_info(self._shared, "GUI: Worker threads started")
         self._refresh_all()
+        _log_info(self._shared, "GUI: Ready")
 
     # -------------------------------------------------------------------------
     # Real Time tab
@@ -436,6 +555,7 @@ class MainWindow(QMainWindow):
         self._lbl_hodlod = QLabel("HOD/LOD: N/A")
         self._lbl_bars = QLabel("Bars since open: N/A")
         self._lbl_md = QLabel("Heartbeat: N/A")
+        self._lbl_conn = QLabel("IBKR Connection: N/A")
 
         grid.addWidget(self._lbl_spy, 0, 0)
         grid.addWidget(self._lbl_vwap, 0, 1)
@@ -443,6 +563,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self._lbl_hodlod, 1, 0)
         grid.addWidget(self._lbl_bars, 1, 1)
         grid.addWidget(self._lbl_md, 1, 2)
+        grid.addWidget(self._lbl_conn, 2, 0)
 
         root.addWidget(box)
 
@@ -1099,24 +1220,17 @@ class MainWindow(QMainWindow):
         self._ledger.setPlainText("\n".join(str(x) for x in ledger[-30:]))
 
     def _refresh_text_panels(self) -> None:
-        with self._shared.lock:
-            snap = self._shared.market
-            trades = list(self._shared.trades.values())
-            locks = dict(self._shared.day_locks)
+        self._status.set_text_preserve_scroll(_build_status_report(self._shared))
 
-        status_lines: List[str] = []
-        if snap is not None:
-            status_lines.append(
-                f"SPY last={_fmt_float(snap.spy_last,2)} vwap={_fmt_float(snap.spy_vwap,2)} "
-                f"dev={_fmt_float(_vwap_dev(snap.spy_last, snap.spy_vwap),6)} bars={len(snap.bars_1m)}"
-            )
-        status_lines.append(
-            f"Day locks: timed={locks.get(DayLockType.STRADDLE_TIMED, False)} "
-            f"gated={locks.get(DayLockType.STRADDLE_GATED, False)} "
-            f"pcs={locks.get(DayLockType.PCS, False)}"
-        )
-        status_lines.append(f"Active trades: {len(trades)}")
-        self._status.setPlainText("\n".join(status_lines))
+        cur_conn = _infer_connected(self._shared)
+        if self._last_connected is None:
+            self._last_connected = cur_conn
+        elif cur_conn != self._last_connected:
+            if cur_conn:
+                _log_info(self._shared, "IBKR: Connected")
+            else:
+                _log_warn(self._shared, "IBKR: Connection lost")
+            self._last_connected = cur_conn
 
         self._events.set_text_preserve_autoscroll(_get_event_rows_text(self._shared))
 
@@ -1169,16 +1283,6 @@ def _infer_connected(shared: "SharedState") -> bool:
             return (time.time() - float(hb_ts)) <= 10.0
     return False
 
-
-
-
-def _fmt_ts(ts: object) -> str:
-    """Format a unix timestamp as MM/DD/YYYY HH:MM:SS.MMM AM/PM."""
-    if not isinstance(ts, (int, float)):
-        return "N/A"
-    dt = datetime.datetime.fromtimestamp(float(ts))
-    ms = int(dt.microsecond / 1000)
-    return dt.strftime("%m/%d/%Y %I:%M:%S") + f".{ms:03d} " + dt.strftime("%p")
 def _fmt_age_s(ts: object, now: float) -> str:
     """Format age in seconds from a unix timestamp."""
     if not isinstance(ts, (int, float)):
@@ -1227,12 +1331,61 @@ def _build_status_report(shared: "SharedState") -> str:
     lines.append(f"  go={go}  debug={debug_mode}  mode={_safe_getattr(cfg.account, 'mode', 'N/A')}")
     lines.append(f"  connected={_infer_connected(shared)}")
 
+
+    lines.append("")
+    lines.append("THREADS")
+    def _age(ts: Optional[float]) -> str:
+        if ts is None or ts <= 0.0:
+            return "N/A"
+        return f"{now - ts:.2f}s"
+
+    lines.append(f"  MarketDataHub hb_age={_age(hb_md)}")
+    lines.append(f"  Planner hb_age={_age(hb_plan)}")
+    lines.append(f"  StraddleSupervisor hb_age={_age(hb_strad)}")
+    lines.append(f"  PCSSupervisor hb_age={_age(hb_pcs)}")
+    lines.append(f"  ExecutionEngine hb_age={_age(hb_exec)}")
+
     lines.append("")
     lines.append("THREAD HEARTBEATS")
-    lines.append(f"  md_hb_time={_fmt_ts(hb_md or hb_snap)}")
-    lines.append(f"  exec_hb_time={_fmt_ts(hb_exec)}")
-    lines.append(f"  md_hb_age={_fmt_age_s(hb_md or hb_snap, now)}  planner_hb_age={_fmt_age_s(hb_plan, now)}")
-    lines.append(f"  straddle_hb_age={_fmt_age_s(hb_strad, now)}  pcs_hb_age={_fmt_age_s(hb_pcs, now)}  exec_hb_age={_fmt_age_s(hb_exec, now)}")
+    md_ts = getattr(shared, "md_heartbeat_ts", 0.0)
+    st_ts = getattr(shared, "straddle_supervisor_heartbeat_ts", 0.0)
+    pcs_ts = getattr(shared, "pcs_supervisor_heartbeat_ts", 0.0)
+    ex_ts = getattr(shared, "execution_heartbeat_ts", 0.0)
+
+    def _run_state(ts: float, stale_s: float = 5.0) -> str:
+        if not ts:
+            return "STOPPED"
+        return "RUNNING" if (_age_s(ts) <= stale_s) else "STALE"
+
+    lines.append(
+        f"  MarketDataHub: {_run_state(md_ts)} last={fmt_ts_et(md_ts) if md_ts else 'N/A'} age_s={_fmt_float(_age_s(md_ts),2) if md_ts else 'N/A'}"
+    )
+    lines.append(
+        f"  StraddleSupervisor: {_run_state(st_ts)} last={fmt_ts_et(st_ts) if st_ts else 'N/A'} age_s={_fmt_float(_age_s(st_ts),2) if st_ts else 'N/A'}"
+    )
+    lines.append(
+        f"  PCSSupervisor: {_run_state(pcs_ts)} last={fmt_ts_et(pcs_ts) if pcs_ts else 'N/A'} age_s={_fmt_float(_age_s(pcs_ts),2) if pcs_ts else 'N/A'}"
+    )
+    lines.append(
+        f"  ExecutionEngine: {_run_state(ex_ts)} last={fmt_ts_et(ex_ts) if ex_ts else 'N/A'} age_s={_fmt_float(_age_s(ex_ts),2) if ex_ts else 'N/A'}"
+    )
+
+    # Connection intent hint (does not guarantee connectivity; explains gating).
+    with shared.lock:
+        acct_mode = getattr(shared.cfg.account, "mode", "PAPER")
+        acct_id_p = (getattr(shared.cfg.account, "paper_account_id", "") or "").strip()
+        acct_id_l = (getattr(shared.cfg.account, "live_account_id", "") or "").strip()
+    selected_id = acct_id_p if str(acct_mode) == "PAPER" else acct_id_l
+    if not selected_id:
+        lines.append("  IBKR Connect: BLOCKED (missing account id for selected mode)")
+
+    with shared.lock:
+        ibkr_connected = bool(getattr(shared, "ibkr_connected", False))
+        ibkr_err = str(getattr(shared, "ibkr_last_error", "") or "").strip()
+    lines.append(f"  IBKR Connected: {'YES' if ibkr_connected else 'NO'}")
+    if ibkr_err:
+        lines.append(f"  IBKR Last Error: {ibkr_err}")
+
 
     lines.append("")
     lines.append("MARKET DATA")
@@ -1284,6 +1437,14 @@ def _call_load_config() -> Any:
         return load_config(CONFIG_PATH)  # type: ignore[misc]
     return load_config()  # type: ignore[misc]
 
+def closeEvent(self, event: QCloseEvent) -> None:
+    """Ensure a clean shutdown signal when the GUI is closed."""
+    try:
+        self._tm.request_stop()
+    except Exception:
+        pass
+    super().closeEvent(event)
+
 
 def run_gui(shared: SharedState) -> int:
     app = QApplication([])
@@ -1291,7 +1452,6 @@ def run_gui(shared: SharedState) -> int:
     win.resize(1500, 860)
     win.show()
     return app.exec()
-
 
 def main() -> int:
     cfg = _call_load_config()
