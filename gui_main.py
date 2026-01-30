@@ -592,7 +592,14 @@ class MainWindow(QMainWindow):
         form.setFormAlignment(Qt.AlignTop)
 
         flat = _flatten_dataclass(self._shared.config)
+        SKIP_KEYS = {
+            "straddle.budget_mode",
+            "pcs.budget_mode",
+        }
+
         for path in sorted(flat.keys()):
+            if path in SKIP_KEYS:
+                continue
             meta = CONFIG_META.get(path)
             if meta is None:
                 desc, tab_for_key = ("(Description missing: add to CONFIG_META.)", self.TAB_DEBUG)
