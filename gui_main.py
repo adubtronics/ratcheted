@@ -546,8 +546,8 @@ class MainWindow(QMainWindow):
         path_mode = f"{strategy}.budget_mode"
         
         with self._shared.lock:
-            mode = getattr(cfg, strategy)   # strategy is "straddle" or "pcs"
-            current = mode.budget_mode
+            section = getattr(self._shared.config, strategy)   # strategy is "straddle" or "pcs"
+            current = section.budget_mode
 
         # Default fallback
         if not isinstance(current, BudgetMode):
@@ -576,6 +576,12 @@ class MainWindow(QMainWindow):
     def _build_config_tab(self, tab_name: str) -> QWidget:
         w = QWidget()
         root = QVBoxLayout(w)
+
+        # Budget mode selection (Option B): both fields remain editable; radio selects which mode is applied.
+        if tab_name == self.TAB_STRADDLE:
+            root.addWidget(self._build_budget_mode_controls("straddle"))
+        elif tab_name == self.TAB_PCS:
+            root.addWidget(self._build_budget_mode_controls("pcs"))
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
